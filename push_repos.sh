@@ -136,36 +136,38 @@ if [ "$DO_TEMPLATE" = "1" ]; then
     if [ "$DRY_RUN" = "1" ]; then
       echo "[push_repos] dry-run: would run push_vps_state.sh --public for both template mirrors"
     else
-      echo "[push_repos] pushing adrien422/claude-vps-template…"
-      if /home/arman/workbench/scripts/push_vps_state.sh --public --repo adrien422/claude-vps-template --force 2>&1 | tail -5; then
-        :
+      # Stage the sanitised snapshot once (push_vps_state.sh's repo-creation step
+      # may fail on adrien422 because gh is logged in as arman-kb24, but it still
+      # leaves a clean /tmp/vps-public-stage tree we can push from over HTTPS).
+      /home/arman/workbench/scripts/push_vps_state.sh --public --repo arman-kb24/claude-vps-template --force >/tmp/push_vps_state.log 2>&1 || true
+      tail -5 /tmp/push_vps_state.log
+
+      if [ ! -d /tmp/vps-public-stage/.git ]; then
+        echo "[push_repos] /tmp/vps-public-stage missing or not a git repo; cannot push templates" >&2
+        push_failures=$((push_failures + 1))
       else
-        # The script exits 1 if its embedded git-push fails because of SSH; fall back to HTTPS push
-        # using the staged tree it leaves in /tmp/vps-public-stage.
-        echo "[push_repos] adrien422/claude-vps-template: falling back to HTTPS push"
-        cd /tmp/vps-public-stage
-        git remote set-url origin "https://adrien422:${ADRIEN_TOKEN}@github.com/adrien422/claude-vps-template.git"
-        git fetch origin main >/dev/null 2>&1 || true
-        if git push -u origin main --force 2>&1 | tail -3; then
-          echo "[push_repos] adrien422/claude-vps-template: pushed (https fallback)"
-        else
-          echo "[push_repos] adrien422/claude-vps-template: PUSH FAILED" >&2
-          push_failures=$((push_failures + 1))
-        fi
+        push_template() {
+          local owner="$1" token="$2"
+          cd /tmp/vps-public-stage
+          git remote remove origin 2>/dev/null || true
+          git remote add origin "https://${owner}:${token}@github.com/${owner}/claude-vps-template.git"
+          git fetch origin main >/dev/null 2>&1 || true
+          if git push -u origin main --force 2>&1 | tail -3; then
+            echo "[push_repos] ${owner}/claude-vps-template: pushed"
+            return 0
+          fi
+          echo "[push_repos] ${owner}/claude-vps-template: PUSH FAILED" >&2
+          return 1
+        }
+
+        echo "[push_repos] pushing adrien422/claude-vps-template…"
+        push_template adrien422 "$ADRIEN_TOKEN" || push_failures=$((push_failures + 1))
+
+        echo "[push_repos] pushing arman-kb24/claude-vps-template…"
+        push_template arman-kb24 "$ARMAN_TOKEN" || push_failures=$((push_failures + 1))
+
         cd "$DISCORD_DIR"
       fi
-
-      echo "[push_repos] pushing arman-kb24/claude-vps-template…"
-      cd /tmp/vps-public-stage
-      git remote set-url origin "https://arman-kb24:${ARMAN_TOKEN}@github.com/arman-kb24/claude-vps-template.git"
-      git fetch origin main >/dev/null 2>&1 || true
-      if git push -u origin main --force 2>&1 | tail -3; then
-        echo "[push_repos] arman-kb24/claude-vps-template: pushed"
-      else
-        echo "[push_repos] arman-kb24/claude-vps-template: PUSH FAILED" >&2
-        push_failures=$((push_failures + 1))
-      fi
-      cd "$DISCORD_DIR"
     fi
   fi
 fi
