@@ -1,54 +1,81 @@
 # Discord COO Environment
 
-- Guild ID: 1499169248402997379
-- Home channel: coo-cockpit (1499180162057769020)
-- Watched channel count: 23
-- Admin command channels: 1499181679980445797, 1499181681779802112, 1499181682941493299
+## Phased rollout
 
-## Categories
+| Phase | Status | DM allowlist | Group features | Inbox | Unlock by |
+|------|--------|--------------|----------------|-------|-----------|
+| 1 — top-down map | **active** | Sean, Na'im, Adrien, Dan (equal access) | OFF | OFF | n/a (default) |
+| 2 — manager rollout | locked | + selected managers (tiered access) | partial, as needed | OFF | Adrien + Dan, after agent files an unlock proposal |
+| 3 — department staff | locked | + staff under each manager (tiered access) | as needed | as needed | Adrien + Dan |
 
-- COO Administration: 1499181678319374358
-- COO Control: 1499180160421986377
-- Cockpits: 1499181686238347514
-- Departments: 1499180166478303312
-- Employee Inbox: 1499180177379430581
-- Strategic Staff: 1499181670438277250
+Phase transition is initiated by the agent: when it judges the map is rich enough it DMs Adrien + Dan with the proposed managers (roles + onboarding order) and the capabilities to unlock; the developers grant the unlock by editing the secrets file and restarting `discord-coo.service`. Sean and Na'im cannot grant phase unlocks.
 
-## Text Channels
+## Stage 1 — DM-only consultancy mode
 
-- #accounting: 1499180170035335311
-- #blockers: 1499180180088819832
-- #coo-admin: 1499181679980445797
-- #coo-audit: 1499181682941493299
-- #coo-cockpit: 1499180162057769020
-- #coo-config: 1499181681779802112
-- #coo-decisions: 1499180163026653245
-- #coo-escalations: 1499180164091871292
-- #coo-pulses: 1499180165115281551
-- #department-cockpit: 1499181689774145598
-- #employee-notes: 1499180178633654343
-- #executive-cockpit: 1499181687479734384
-- #finance-strategy: 1499181675001675959
-- #handoffs: 1499180180894257255
-- #leadership: 1499181673000992849
-- #manager-cockpit: 1499181688956260492
-- #operations: 1499180168848216128
-- #people: 1499180176175534321
-- #sales: 1499180171620515917
-- #strategy: 1499181671839170794
-- #support: 1499180173021679778
-- #tech: 1499180174430830767
+- **Group/department features are FLAGGED OFF** (`DISCORD_COO_GROUP_FEATURES_ENABLED=0`). Channel routing, slash/prefix group commands, the cockpit panel, channel factsheets, and proactive channel pulses are all disabled.
+- **Reference inbox is FLAGGED OFF** (`DISCORD_COO_INBOX_ENABLED=0`). Ongoing and pending tasks are tracked live in DM conversations, not in the saved inbox.
+- **DM-only mode is ON** (`DISCORD_COO_DM_ONLY=1`). The bot listens for DMs from a small allowlist only. All other messages are silently ignored.
 
-## Operating Notes
+### DM allowlist (all equal access)
 
-- General department and inbox channels accept employee messages; unsolicited messages are saved to the reference inbox.
-- Locked Strategic Staff, COO Administration, and Cockpits rooms are for higher-trust work.
-- Admin COO controls are restricted to coo-admin, coo-config, and coo-audit.
-- Human messages reach the COO agent only when they reply to a COO bot message; admin rooms additionally require mentioning the bot.
-- Daily per-channel transcripts live under reference/transcripts and include clear sender names.
-- Saved reference messages keep classification tags in the files themselves, while workflow state is tracked separately as pending, queued, held, no-action, initiated, or failed.
-- The inbox monitor periodically queues pending/failed reference messages for COO attention.
-- `/coo cockpit` opens the Discord-native cockpit panel. Admin buttons appear only in admin rooms.
-- `/coo queue` shows browsable workflow state, open follow-ups, and automation lanes; `/coo review` immediately queues pending inbox messages for attention.
-- `/coo facts` shows the current room's weekly/monthly factsheets; `/coo updatefacts` queues an agent refresh for those factsheets.
-- Use Discord messages for workplace output; the tmux Codex/Claude pane remains headless backend state.
+| Role | Person | Env var |
+|------|--------|---------|
+| CEO (mapping target) | Sean | `DISCORD_COO_CEO_USER_ID` |
+| Owner (mapping target + content authority) | Na'im | `DISCORD_COO_OWNER_USER_ID` |
+| Developer (technical approver) | Adrien | included in `DISCORD_COO_DEV_USER_IDS` |
+| Developer (technical approver) | Dan | included in `DISCORD_COO_DEV_USER_IDS` |
+
+The full allowlist is `DISCORD_COO_DM_ALLOWLIST` (comma-separated user IDs). Until the IDs are filled in, only the test user that is configured can DM the bot.
+
+### Guild membership
+
+- The bot must remain a member of the existing `Claudex` guild because Discord requires bot+user mutual-server membership for the bot to initiate DMs. The guild's channels are not used in stage 1.
+
+## Mission and workflow
+
+- The agent's mission this stage is the **company map**: structure, departments, members, positions, ongoing tasks/workflows, top priorities. Sourced from interviews with **Sean and Na'im**.
+- Company-map artefacts live under `company-map/` (modular):
+  - `README.md` — modular layout rules (one folder per department/project).
+  - `org-chart.md`, `priorities.md`, `workflows.md` — company-wide content.
+  - `factsheet-template.md` — the template Sean asked for; the agent derives it from interviews.
+  - `interview-questions.md` — starter cheat sheet so the agent doesn't go in empty-handed.
+  - `department-template.md`, `project-template.md` — templates for new sub-folders.
+  - `interview-log.jsonl` — append-only log of bot-initiated nudges and self-scheduling decisions.
+  - `people/<slug>.md` — per-person factsheets following the template.
+  - `departments/<slug>/{department.md, workflows.md, priorities.md}` — one folder per department.
+  - `projects/<slug>/project.md` — one folder per project/initiative.
+  - `access-tiers.md` — created at phase 2 to record per-role access levels.
+- The agent self-paces: after each meaningful exchange it emits `[[COO_NEXT_CONTACT user_id=<discord_user_id> in_seconds=<int> reason=<short>]]`; the bridge stores the marker and at the right moment prompts the live agent session (no new session is spawned).
+
+## DM cockpit (1:1)
+
+Prefix commands available in DM for the allowlist (no slash-command re-registration needed):
+
+- `!coo cockpit` — phase + flag state + map counts + upcoming next-contacts + recent dev-gate proposals.
+- `!coo phase` — phase plan.
+- `!coo map` — list of company-map files.
+- `!coo nextcontacts` — upcoming agent-scheduled DM nudges.
+- `!coo proposals` — recent dev-gate doc-change proposals.
+- `!coo factsheet <slug>` — read a person factsheet.
+
+## Dev-gate approval (absolute)
+
+Before any file write under `company-map/`, any skill, project, md, or code file:
+
+1. Run `python3 propose_doc_change.py --path … --summary … [--body-file …] [--diff-file …]`.
+2. The helper DMs each developer (Adrien + Dan) with the proposal and DMs the owner (Na'im) with the content-review notice.
+3. Both devs must reply `approve <id>` (technical green-light); content fitness is not their call.
+4. Once both devs approve, Na'im replies `approve <id>` to authorise the content write.
+5. Only then may the agent perform the write.
+
+Sean and Na'im cannot bypass the dev technical gate even by insisting. If they push for a code/env change directly, the agent must refuse and route through Adrien and Dan first.
+
+## Toggling features back on
+
+To re-enable the legacy group/inbox surface later, set in the bot env:
+
+- `DISCORD_COO_GROUP_FEATURES_ENABLED=1`
+- `DISCORD_COO_INBOX_ENABLED=1`
+- `DISCORD_COO_DM_ONLY=0` (if you want the bot to also reach into channels again).
+
+Then restart `discord-coo.service`.
