@@ -55,6 +55,30 @@ INBOX_ATTENTION_BATCH_SIZE = int(os.environ.get("DISCORD_COO_INBOX_ATTENTION_BAT
 CONVERSATION_MODE = os.environ.get("DISCORD_COO_CONVERSATION_MODE", "bot_owned").strip().lower()
 CONVERSATION_TTL_SECONDS = float(os.environ.get("DISCORD_COO_CONVERSATION_TTL_SECONDS", "86400"))
 UNSOLICITED_ACK_COOLDOWN_SECONDS = float(os.environ.get("DISCORD_COO_UNSOLICITED_ACK_COOLDOWN_SECONDS", "900"))
+
+
+def _bool_env(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _id_set_env(name: str) -> set[str]:
+    return {c.strip() for c in os.environ.get(name, "").split(",") if c.strip()}
+
+
+# Stage-1 feature flags. Group/department features are disabled by default while the bot
+# operates as a DM-only consultant for a small allowlist (devs + CEO + owner). Flip these
+# back on later when the group surface is reintroduced.
+GROUP_FEATURES_ENABLED = _bool_env("DISCORD_COO_GROUP_FEATURES_ENABLED", "0")
+INBOX_ENABLED = _bool_env("DISCORD_COO_INBOX_ENABLED", "0")
+DM_ONLY = _bool_env("DISCORD_COO_DM_ONLY", "1")
+DM_ALLOWLIST = _id_set_env("DISCORD_COO_DM_ALLOWLIST")
+DEV_USER_IDS = _id_set_env("DISCORD_COO_DEV_USER_IDS")
+OWNER_USER_ID = os.environ.get("DISCORD_COO_OWNER_USER_ID", "").strip()
+CEO_USER_ID = os.environ.get("DISCORD_COO_CEO_USER_ID", "").strip()
+INTERVIEW_TICK_SECONDS = float(os.environ.get("DISCORD_COO_INTERVIEW_TICK_SECONDS", "60"))
+INTERVIEW_DEFAULT_NEXT_CONTACT_SECONDS = float(
+    os.environ.get("DISCORD_COO_INTERVIEW_DEFAULT_NEXT_CONTACT_SECONDS", "3600")
+)
 TMUX_SESSION = os.environ.get("DISCORD_COO_TMUX_SESSION", "discord_coo")
 TMUX_WINDOW = os.environ.get("DISCORD_COO_TMUX_WINDOW", "agent")
 TMUX_TARGET = f"{TMUX_SESSION}:{TMUX_WINDOW}.0"
@@ -63,6 +87,8 @@ STATE_DIR = Path(os.environ.get("DISCORD_COO_STATE_DIR", "/home/arman/workbench/
 REFERENCE_DIR = Path(os.environ.get("DISCORD_COO_REFERENCE_DIR", str(WORKDIR / "reference" / "inbox")))
 TRANSCRIPT_DIR = Path(os.environ.get("DISCORD_COO_TRANSCRIPT_DIR", str(WORKDIR / "reference" / "transcripts")))
 FACTSHEET_DIR = Path(os.environ.get("DISCORD_COO_FACTSHEET_DIR", str(WORKDIR / "reference" / "factsheets")))
+COMPANY_MAP_DIR = Path(os.environ.get("DISCORD_COO_COMPANY_MAP_DIR", str(WORKDIR / "company-map")))
+INTERVIEW_LOG = Path(os.environ.get("DISCORD_COO_INTERVIEW_LOG", str(COMPANY_MAP_DIR / "interview-log.jsonl")))
 STATE_FILE = STATE_DIR / "state.json"
 EVENT_LOG = STATE_DIR / "events.jsonl"
 RUN_AI = os.environ.get("DISCORD_COO_RUN_AI", "/home/arman/workbench/run_ai_persistent.sh")
@@ -73,6 +99,9 @@ DISCORD_API = "https://discord.com/api/v10"
 CONTROL_CLOSE = "[[COO_CLOSE]]"
 CONTROL_HOLD = "[[COO_HOLD]]"
 CONTROL_NO_ACTION = "[[COO_NO_ACTION]]"
+NEXT_CONTACT_RE = re.compile(
+    r"\[\[COO_NEXT_CONTACT\s+user_id=(?P<user_id>\d+)\s+in_seconds=(?P<seconds>\d+)(?:\s+reason=(?P<reason>[^\]]*))?\]\]"
+)
 MENTION_RE = re.compile(r"<@!?(\d+)>")
 REFERENCE_WORKFLOW_STATES = ("pending", "queued", "held", "no-action", "initiated", "failed", "attended")
 REFERENCE_QUEUEABLE_STATES = ("pending", "failed")
@@ -127,6 +156,201 @@ Operating rules:
 - When a scheduled COO pulse arrives and no public action is useful, reply exactly NOOP.
 - Do not reveal secrets, tokens, cookies, or private credentials in Discord.
 - If you need a browser/account/tool that is not wired yet, say exactly what credential or setup is missing.
+"""
+
+
+COO_DM_MISSION = f"""You are Claudex COO in DM-only consultancy mode.
+
+This deployment matures in three phases. You are CURRENTLY in PHASE 1.
+
+PHASE 1 — Top-down company mapping (active now):
+- Group/department features are flagged OFF. There are no Discord channel rooms in scope.
+- DM allowlist (all equal-access at this phase):
+    * Sean — CEO — primary mapping interview target
+    * Na'im — owner — primary mapping interview target and final content authority
+    * Adrien — developer — technical approver only
+    * Dan — developer — technical approver only
+- Your top mission this phase is to build the company map by interviewing **Sean and Na'im**.
+  The mapping covers organisational structure, department composition, each member's
+  position, ongoing tasks and workflows, and the highest-priority items. The company map
+  lives under {COMPANY_MAP_DIR}.
+- A second deliverable is the **factsheet template** that Sean asked for. Maintain it at
+  `{COMPANY_MAP_DIR}/factsheet-template.md` as you derive it from the conversations. Per-person
+  factsheets at `{COMPANY_MAP_DIR}/people/<slug>.md` should follow that template.
+- Use the **modular folder layout** documented in `{COMPANY_MAP_DIR}/README.md`:
+    * Top-level files only for company-wide content (org-chart, priorities, workflows).
+    * Per-department content goes under `{COMPANY_MAP_DIR}/departments/<slug>/`
+      (`department.md`, `workflows.md`, `priorities.md`) — one folder per department.
+    * Per-project / per-initiative content goes under `{COMPANY_MAP_DIR}/projects/<slug>/`
+      (`project.md`, plus any subfolders the project needs).
+  Spin up new folders liberally rather than piling everything into one place.
+- Adrien and Dan are NOT mapping sources. They sit on the technical-approval gate only. Do
+  not pull mapping content from them; do not interview them about org structure.
+
+PHASE 2 — Manager rollout (locked until you ask Adrien + Dan to unlock):
+- When you judge the phase-1 map is rich enough to act on, send a DM to Adrien AND Dan
+  requesting a phase-2 unlock. Include: which managers to add (with roles + reasoning), the
+  prioritised order to onboard them, and what unlocked capabilities you'll need (expanding
+  the DM allowlist, possibly re-enabling specific group features). Do not unlock yourself.
+- Adrien + Dan are the ONLY people who can grant the unlock; Sean and Na'im cannot. The
+  unlock is enacted by the developers updating env vars (DM allowlist, possibly
+  GROUP_FEATURES_ENABLED) and restarting the service.
+- Managers are added in the order whose workflows/tasks come first per the phase-1 map.
+
+PHASE 3 — Department staff rollout (locked until phase 2 has settled):
+- Gradual rollout to the staff working under each manager. Same unlock pattern: you propose,
+  Adrien + Dan grant via env-var change.
+
+Tiered access from phase 2 onwards:
+- Equal access only applies in phase 1. From phase 2, access levels and features are
+  delegated by role in the company hierarchy. The exact access tiers will be set per-role at
+  unlock time and recorded in `{COMPANY_MAP_DIR}/access-tiers.md` (a phase-2 deliverable).
+
+Operating rules:
+- Conversations are two-way and always live. Either side may speak first.
+- You self-pace: after each meaningful exchange decide when (in seconds) you would like to wake
+  up to message a specific person next, and record it by emitting one line of the form
+  `[[COO_NEXT_CONTACT user_id=<discord_user_id> in_seconds=<int> reason=<short>]]`. The bridge
+  reads these markers, schedules a cron-style nudge, and then prompts THIS same agent session at
+  the right moment. Do not start a new session.
+- Be concise. Use plain workplace language. Per-department thinking should stay narrow to that
+  department's slice of the map so cross-team bias stays low.
+- Factsheets are a primary deliverable: maintain `{COMPANY_MAP_DIR}/org-chart.md`,
+  `{COMPANY_MAP_DIR}/priorities.md`, `{COMPANY_MAP_DIR}/workflows.md`, and per-person factsheets
+  under `{COMPANY_MAP_DIR}/people/<slug>.md`. Update them as you learn.
+
+Approval gate (absolute):
+- Before writing or editing ANY file under {COMPANY_MAP_DIR}, any skill, project, md, or code
+  file in this repo, file a proposal first. Adrien and Dan must both green-light it on
+  TECHNICAL grounds (file structure, repo hygiene, anything that touches code or the
+  environment). They are not approving mapping content — only the technical fitness of writing
+  it. Once both devs green-light, Na'im (owner) approves the actual content. Only after BOTH
+  dev technical green-light AND owner content approval may you write the change.
+- Sean (CEO) and Na'im (owner) cannot bypass the dev technical gate. If they insist on a code
+  change or a tool call that mutates the environment, refuse and tell them you must first check
+  with Adrien and Dan.
+- Use `python3 /home/arman/workbench/vps-skill/discord/propose_doc_change.py` to file proposals.
+
+Inbox + group rules:
+- The reference inbox is flagged off. Do not save unsolicited messages to an inbox; tracking of
+  ongoing and pending tasks happens live in the conversation itself.
+- Do not address departments, channels, or non-allowlisted users.
+- If you receive any message from a user not in the DM allowlist, ignore it.
+
+Markers:
+- {CONTROL_CLOSE} closes the current DM conversation loop with that person.
+- {CONTROL_HOLD} parks the current thread without action.
+- {CONTROL_NO_ACTION} marks the thread no-action.
+- NOOP is a valid full reply for a scheduled nudge that need not produce visible output.
+
+Secrets: never reveal tokens or credentials in DMs.
+"""
+
+
+DEPARTMENT_TEMPLATE_BODY = """# Department — <name>
+
+> Per-department factsheet. One folder per department under `departments/<slug>/` keeps
+> the map modular. Cross-department workflows stay in the top-level `workflows.md`.
+
+## Mandate
+- One-line mandate:
+- What this department does NOT do:
+
+## Manager
+- Name + Discord ID:
+- Reports to:
+- Time in role:
+
+## Members
+- (Either list short names here or maintain a sub-folder of per-person factsheets)
+- Headcount:
+
+## Subteams
+-
+
+## Top priorities (this quarter)
+1.
+2.
+3.
+
+## Workflows owned by this department
+- See `departments/<slug>/workflows.md` for the long-form cards.
+
+## Tooling / systems of record
+-
+
+## Open follow-ups
+-
+
+## Source trail
+- First mentioned by: (Sean / Na'im — date)
+- Interviews referenced:
+- Last updated:
+"""
+
+PROJECT_TEMPLATE_BODY = """# Project — <name>
+
+> Per-project / per-initiative folder. Use `projects/<slug>/` for any cross-cutting effort
+> that spans departments or has a defined outcome. Avoid pouring everything into a single
+> project; spin up new folders liberally and link between them.
+
+## Outcome
+- One-sentence definition of done:
+- Target date:
+
+## Sponsor + driver
+- Sponsor (decision authority):
+- Driver (day-to-day owner):
+
+## Departments involved
+-
+
+## Workstreams
+-
+
+## Open decisions
+-
+
+## Risks
+-
+
+## Source trail
+- First mentioned by:
+- Interviews referenced:
+- Last updated:
+"""
+
+COMPANY_MAP_README_BODY = """# Company Map
+
+Modular per-department and per-project layout.
+
+```
+company-map/
+├── README.md                ← this file
+├── org-chart.md             ← top-down org view
+├── priorities.md            ← company-wide priorities
+├── workflows.md             ← cross-department workflows
+├── factsheet-template.md    ← per-person factsheet template
+├── interview-questions.md   ← cheat sheet for the agent
+├── interview-log.jsonl      ← append-only self-scheduling log
+├── people/
+│   └── <slug>.md            ← one factsheet per person
+├── departments/
+│   └── <slug>/
+│       ├── department.md    ← per-department factsheet (see department-template.md)
+│       ├── workflows.md     ← workflows owned by this department
+│       └── priorities.md    ← department-level priorities
+└── projects/
+    └── <slug>/
+        └── project.md       ← per-project factsheet (see project-template.md)
+```
+
+Rules:
+- Spin up new folders rather than piling everything into one place.
+- Cross-department content stays at the top level. Department-internal content lives
+  under `departments/<slug>/`.
+- Every file write goes through the dev gate (`propose_doc_change.py`) — Adrien + Dan
+  technical-approve, then Na'im content-approves.
 """
 
 
@@ -228,8 +452,9 @@ class DiscordCOO:
             await self.refresh_application_admins()
             await self.refresh_channel_names()
             if created or not self.state.get("mission_sent_at"):
+                mission_text = COO_DM_MISSION if DM_ONLY else COO_MISSION
                 await self.queue.put(AgentPrompt(
-                    text=COO_MISSION,
+                    text=mission_text,
                     channel_id=self.home_channel_id(),
                     kind="mission",
                     queued_at=time.time(),
@@ -237,10 +462,14 @@ class DiscordCOO:
             tasks = [
                 asyncio.create_task(self.agent_worker(), name="agent_worker"),
                 asyncio.create_task(self.agent_forwarder(), name="agent_forwarder"),
-                asyncio.create_task(self.proactive_loop(), name="proactive_loop"),
-                asyncio.create_task(self.inbox_monitor_loop(), name="inbox_monitor_loop"),
                 asyncio.create_task(self.gateway_loop(), name="gateway_loop"),
             ]
+            if GROUP_FEATURES_ENABLED:
+                tasks.append(asyncio.create_task(self.proactive_loop(), name="proactive_loop"))
+            else:
+                tasks.append(asyncio.create_task(self.interview_scheduler_loop(), name="interview_scheduler_loop"))
+            if INBOX_ENABLED:
+                tasks.append(asyncio.create_task(self.inbox_monitor_loop(), name="inbox_monitor_loop"))
             try:
                 await self.stop_event.wait()
             finally:
@@ -254,6 +483,26 @@ class DiscordCOO:
         REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
         TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
         FACTSHEET_DIR.mkdir(parents=True, exist_ok=True)
+        COMPANY_MAP_DIR.mkdir(parents=True, exist_ok=True)
+        for sub in ("people", "departments", "projects"):
+            (COMPANY_MAP_DIR / sub).mkdir(parents=True, exist_ok=True)
+        for stub_name, stub_body in (
+            ("org-chart.md", "# Org Chart\n\n(starter scaffold present — do not overwrite without dev-gate approval)\n"),
+            ("priorities.md", "# Priorities\n\n(starter scaffold present — do not overwrite without dev-gate approval)\n"),
+            ("workflows.md", "# Workflows\n\n(starter scaffold present — do not overwrite without dev-gate approval)\n"),
+            ("factsheet-template.md", "# Factsheet Template\n\n(starter scaffold present — do not overwrite without dev-gate approval)\n"),
+            ("interview-questions.md", "# Interview Cheat Sheet\n\n(starter scaffold present — do not overwrite without dev-gate approval)\n"),
+            ("department-template.md", DEPARTMENT_TEMPLATE_BODY),
+            ("project-template.md", PROJECT_TEMPLATE_BODY),
+        ):
+            stub_path = COMPANY_MAP_DIR / stub_name
+            if not stub_path.exists():
+                stub_path.write_text(stub_body)
+        readme = COMPANY_MAP_DIR / "README.md"
+        if not readme.exists():
+            readme.write_text(COMPANY_MAP_README_BODY)
+        if not INTERVIEW_LOG.exists():
+            INTERVIEW_LOG.touch()
         agents = WORKDIR / "AGENTS.md"
         if not agents.exists():
             agents.write_text(
@@ -406,6 +655,92 @@ class DiscordCOO:
             ))
             self._event("scheduled_pulse_queued")
 
+    async def interview_scheduler_loop(self) -> None:
+        while not self.stop_event.is_set():
+            await asyncio.sleep(INTERVIEW_TICK_SECONDS)
+            try:
+                await self.interview_scheduler_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.log.exception("interview scheduler tick failed")
+
+    async def interview_scheduler_tick(self) -> None:
+        contacts = self.state.setdefault("next_contacts", {})
+        now = time.time()
+        due_user_ids = [
+            uid for uid, entry in contacts.items()
+            if isinstance(entry, dict) and float(entry.get("due_at", 0)) <= now and not entry.get("queued")
+        ]
+        if not due_user_ids:
+            return
+        for user_id in due_user_ids:
+            entry = contacts[user_id]
+            channel_id = await self._dm_channel_for_user(user_id)
+            if not channel_id:
+                self.log.warning("interview scheduler could not open DM channel for %s", user_id)
+                continue
+            reason = str(entry.get("reason") or "")
+            prompt = (
+                f"[scheduled COO interview nudge user_id={user_id} dm_channel_id={channel_id}]\n"
+                f"Reason: {reason or 'self-scheduled follow-up'}\n\n"
+                "Decide what (if anything) to send next to this person now. If a message would be useful, "
+                "send the concise DM that should appear. After sending, emit a fresh "
+                "[[COO_NEXT_CONTACT user_id=... in_seconds=... reason=...]] marker so the bridge knows when "
+                "to wake you up next for them. Reply NOOP if nothing useful to say right now."
+            )
+            await self.queue.put(AgentPrompt(
+                text=prompt,
+                channel_id=channel_id,
+                kind="interview_scheduled",
+                queued_at=time.time(),
+            ))
+            entry["queued"] = True
+            entry["queued_at"] = now
+        self._save_state()
+        self._event("interview_nudges_queued", user_ids=due_user_ids)
+
+    async def _dm_channel_for_user(self, user_id: str) -> str | None:
+        cache = self.state.setdefault("dm_channels", {})
+        cached = cache.get(user_id)
+        if cached:
+            return str(cached)
+        try:
+            data = await self.discord_post("/users/@me/channels", {"recipient_id": str(user_id)})
+        except Exception:
+            self.log.exception("failed to create DM channel for user %s", user_id)
+            return None
+        channel_id = str((data or {}).get("id") or "")
+        if channel_id:
+            cache[user_id] = channel_id
+            self._save_state()
+        return channel_id or None
+
+    def _record_next_contact(self, text: str) -> tuple[str, list[dict[str, Any]]]:
+        markers = []
+        contacts = self.state.setdefault("next_contacts", {})
+        now = time.time()
+        for match in NEXT_CONTACT_RE.finditer(text):
+            user_id = match.group("user_id")
+            try:
+                seconds = max(int(match.group("seconds")), 30)
+            except (TypeError, ValueError):
+                seconds = int(INTERVIEW_DEFAULT_NEXT_CONTACT_SECONDS)
+            reason = (match.group("reason") or "").strip()
+            contacts[user_id] = {
+                "due_at": now + seconds,
+                "reason": reason,
+                "set_at": now,
+                "queued": False,
+            }
+            markers.append({"user_id": user_id, "in_seconds": seconds, "reason": reason})
+        if markers:
+            self._save_state()
+            with INTERVIEW_LOG.open("a") as f:
+                for entry in markers:
+                    f.write(json.dumps({"ts": now, **entry}, ensure_ascii=False) + "\n")
+        return NEXT_CONTACT_RE.sub("", text), markers
+
     async def inbox_monitor_loop(self) -> None:
         if INBOX_MONITOR_INTERVAL <= 0:
             return
@@ -524,10 +859,20 @@ class DiscordCOO:
         author_id = str(author.get("id") or "")
         if author.get("bot"):
             return
-        if guild_id != GUILD_ID:
-            return
-        if channel_id not in self.channel_ids():
-            return
+        is_dm = not guild_id
+        if DM_ONLY:
+            if not is_dm:
+                # Group/department surface flagged off — silently ignore guild messages.
+                return
+            if DM_ALLOWLIST and author_id not in DM_ALLOWLIST:
+                return
+        else:
+            if guild_id != GUILD_ID:
+                return
+            if not GROUP_FEATURES_ENABLED:
+                return
+            if channel_id not in self.channel_ids():
+                return
         content = str(data.get("content") or "").strip()
         message_id = str(data.get("id") or "")
         if not content and not data.get("attachments"):
@@ -535,18 +880,24 @@ class DiscordCOO:
         self.save_daily_transcript(data, direction="inbound")
 
         if content.startswith(PREFIX):
+            if DM_ONLY and not is_dm:
+                return
             await self.handle_command(data, content[len(PREFIX):].strip())
             return
 
-        is_admin_user = self.is_admin(author_id)
-        allowed, reject_reason = self.message_may_reach_agent(data)
+        is_admin_user = self.is_admin(author_id) or (DM_ONLY and author_id in DM_ALLOWLIST)
+        if DM_ONLY:
+            allowed, reject_reason = True, "dm_allowlisted"
+        else:
+            allowed, reject_reason = self.message_may_reach_agent(data)
         if CONVERSATION_MODE == "bot_owned" and not allowed:
-            await self.handle_reference_only_message(data, reject_reason)
+            if INBOX_ENABLED:
+                await self.handle_reference_only_message(data, reject_reason)
             return
 
         prompt = self.build_agent_prompt(
             data,
-            conversation_kind="manager_seed" if is_admin_user else "employee_reply_to_coo_open_loop",
+            conversation_kind=self._conversation_kind_for(author_id, is_dm, is_admin_user),
         )
         was_busy = self.pane_state() != "input_ready"
         await self.queue.put(AgentPrompt(
@@ -566,7 +917,132 @@ class DiscordCOO:
                 reference_message_id=message_id,
             )
 
+    def dm_cockpit_text(self) -> str:
+        contacts = self.state.get("next_contacts") or {}
+        upcoming = sorted(
+            (
+                (uid, float(entry.get("due_at", 0)), str(entry.get("reason") or ""))
+                for uid, entry in contacts.items()
+                if isinstance(entry, dict)
+            ),
+            key=lambda row: row[1],
+        )[:6]
+        next_lines = (
+            [f"- `{uid}` in {max(int(due - time.time()), 0)}s — {reason or '(no reason)'}" for uid, due, reason in upcoming]
+            or ["- (no scheduled nudges)"]
+        )
+        proposals_dir = STATE_DIR / "proposals"
+        recent_proposals = []
+        if proposals_dir.exists():
+            for path in sorted(proposals_dir.glob("prop-*.json"))[-5:]:
+                try:
+                    rec = json.loads(path.read_text())
+                except Exception:
+                    continue
+                recent_proposals.append(f"- `{rec.get('id')}` → `{rec.get('path')}` ({rec.get('status')})")
+        if not recent_proposals:
+            recent_proposals = ["- (no proposals filed yet)"]
+        people_dir = COMPANY_MAP_DIR / "people"
+        departments_dir = COMPANY_MAP_DIR / "departments"
+        projects_dir = COMPANY_MAP_DIR / "projects"
+        people_count = sum(1 for _ in people_dir.glob("*.md")) if people_dir.exists() else 0
+        dept_count = sum(1 for _ in departments_dir.iterdir() if _.is_dir()) if departments_dir.exists() else 0
+        project_count = sum(1 for _ in projects_dir.iterdir() if _.is_dir()) if projects_dir.exists() else 0
+        return (
+            "**Claudex DM cockpit**\n"
+            f"- Phase: 1 (DM-only mapping with Sean and Na'im)\n"
+            f"- Group features: {'on' if GROUP_FEATURES_ENABLED else 'off'}\n"
+            f"- Inbox: {'on' if INBOX_ENABLED else 'off'}\n"
+            f"- DM allowlist size: {len(DM_ALLOWLIST)}\n"
+            f"- Company map: {people_count} people · {dept_count} departments · {project_count} projects\n"
+            "\n**Upcoming next-contacts**\n"
+            + "\n".join(next_lines)
+            + "\n\n**Recent dev-gate proposals**\n"
+            + "\n".join(recent_proposals)
+            + "\n\nPrefix commands available in this DM: `!coo phase`, `!coo map`, `!coo nextcontacts`, `!coo proposals`, `!coo factsheet <slug>`."
+        )
+
+    def dm_phase_text(self) -> str:
+        return (
+            "**Phase 1 — top-down mapping (active)**\n"
+            "- Targets: Sean (CEO), Na'im (owner)\n"
+            "- Devs (technical gate): Adrien, Dan\n"
+            "- Group features: OFF · Inbox: OFF\n"
+            "**Phase 2 — manager rollout (locked)**: agent files unlock proposal to Adrien + Dan once map is rich enough.\n"
+            "**Phase 3 — staff rollout (locked)**: gradual rollout, tiered access by role."
+        )
+
+    def dm_map_text(self) -> str:
+        if not COMPANY_MAP_DIR.exists():
+            return "Company map directory not yet initialised."
+        lines = ["**Company map files:**"]
+        for path in sorted(COMPANY_MAP_DIR.glob("*.md")):
+            lines.append(f"- `{path.relative_to(COMPANY_MAP_DIR)}`")
+        for sub in ("departments", "projects", "people"):
+            sub_dir = COMPANY_MAP_DIR / sub
+            if not sub_dir.exists():
+                continue
+            entries = sorted(sub_dir.iterdir())
+            count = len([e for e in entries if (e.is_dir() if sub != "people" else e.suffix == ".md")])
+            lines.append(f"- `{sub}/` — {count} entr{'y' if count == 1 else 'ies'}")
+        return "\n".join(lines)
+
+    def dm_proposals_text(self) -> str:
+        proposals_dir = STATE_DIR / "proposals"
+        if not proposals_dir.exists():
+            return "No proposals filed yet."
+        rows = []
+        for path in sorted(proposals_dir.glob("prop-*.json"))[-10:]:
+            try:
+                rec = json.loads(path.read_text())
+            except Exception:
+                continue
+            rows.append(f"- `{rec.get('id')}` → `{rec.get('path')}` — {rec.get('summary')} (status: `{rec.get('status')}`)")
+        return "\n".join(rows) or "No proposals filed yet."
+
+    def dm_nextcontacts_text(self) -> str:
+        contacts = self.state.get("next_contacts") or {}
+        if not contacts:
+            return "No scheduled next-contacts."
+        rows = []
+        now = time.time()
+        for user_id, entry in sorted(contacts.items(), key=lambda kv: float(kv[1].get("due_at", 0))):
+            if not isinstance(entry, dict):
+                continue
+            wait_s = max(int(float(entry.get("due_at", 0)) - now), 0)
+            queued = " (queued)" if entry.get("queued") else ""
+            rows.append(f"- `{user_id}` in {wait_s}s — {entry.get('reason') or '(no reason)'}{queued}")
+        return "\n".join(rows)
+
+    def dm_factsheet_text(self, slug: str) -> str:
+        slug = self.slugify(slug)
+        path = COMPANY_MAP_DIR / "people" / f"{slug}.md"
+        if not path.exists():
+            return f"No factsheet at `{path.relative_to(COMPANY_MAP_DIR)}` yet. Use the dev gate to propose one."
+        body = path.read_text()
+        if len(body) > 1500:
+            body = body[:1500] + "\n…(truncated)"
+        return f"**Factsheet `{slug}`**\n```\n{body}\n```"
+
+    def _conversation_kind_for(self, author_id: str, is_dm: bool, is_admin_user: bool) -> str:
+        if DM_ONLY and is_dm:
+            if author_id == OWNER_USER_ID:
+                return "dm_owner"
+            if author_id == CEO_USER_ID:
+                return "dm_ceo"
+            if author_id in DEV_USER_IDS:
+                return "dm_developer"
+            return "dm_allowlisted"
+        return "manager_seed" if is_admin_user else "employee_reply_to_coo_open_loop"
+
     async def handle_interaction(self, data: dict[str, Any]) -> None:
+        if not GROUP_FEATURES_ENABLED:
+            await self.respond_interaction(
+                data,
+                "COO group/department features are disabled in stage 1 (DM-only consultancy mode).",
+                ephemeral=True,
+            )
+            return
         if str(data.get("guild_id") or "") != GUILD_ID:
             return
         channel_id = str(data.get("channel_id") or "")
@@ -1534,6 +2010,32 @@ class DiscordCOO:
         parts = command.split()
         name = (parts[0].lower() if parts else "help")
         rest = command[len(parts[0]):].strip() if parts else ""
+        group_only = {"watch", "unwatch", "home", "channels", "followups", "conversations"}
+        inbox_only = {"inbox", "queue", "review", "tags", "updatefacts"}
+        if name in group_only and not GROUP_FEATURES_ENABLED:
+            await self.send_discord(channel_id, "Group/department features are flagged off in stage 1.", reference_message_id=message_id)
+            return
+        if name in inbox_only and not INBOX_ENABLED:
+            await self.send_discord(channel_id, "Inbox features are flagged off in stage 1.", reference_message_id=message_id)
+            return
+        dm_cockpit_cmds = {"cockpit", "phase", "map", "nextcontacts", "proposals", "factsheet"}
+        if name in dm_cockpit_cmds:
+            if name == "cockpit":
+                await self.send_discord(channel_id, self.dm_cockpit_text(), reference_message_id=message_id)
+            elif name == "phase":
+                await self.send_discord(channel_id, self.dm_phase_text(), reference_message_id=message_id)
+            elif name == "map":
+                await self.send_discord(channel_id, self.dm_map_text(), reference_message_id=message_id)
+            elif name == "nextcontacts":
+                await self.send_discord(channel_id, self.dm_nextcontacts_text(), reference_message_id=message_id)
+            elif name == "proposals":
+                await self.send_discord(channel_id, self.dm_proposals_text(), reference_message_id=message_id)
+            elif name == "factsheet":
+                if not rest:
+                    await self.send_discord(channel_id, "Usage: `!coo factsheet <person-slug>`", reference_message_id=message_id)
+                else:
+                    await self.send_discord(channel_id, self.dm_factsheet_text(rest), reference_message_id=message_id)
+            return
         admin_only = {"interrupt", "compact", "clear", "enter", "pulse", "boot", "send", "watch", "unwatch", "home", "close", "followups", "conversations", "inbox", "queue", "review", "tags", "updatefacts"}
         if name in admin_only and not self.can_run_admin_command(author_id, channel_id):
             await self.send_discord(
@@ -1633,9 +2135,13 @@ class DiscordCOO:
         subprocess.run(["tmux", "send-keys", "-t", TMUX_TARGET, "Enter"], timeout=5, check=True)
 
     def is_admin(self, author_id: str) -> bool:
+        if DM_ONLY and author_id in DM_ALLOWLIST:
+            return True
         return author_id in self.admin_user_ids
 
     def can_run_admin_command(self, author_id: str, channel_id: str) -> bool:
+        if DM_ONLY and author_id in DM_ALLOWLIST:
+            return True
         if not self.is_admin(author_id):
             return False
         return not ADMIN_CHANNEL_IDS or channel_id in ADMIN_CHANNEL_IDS
@@ -1787,6 +2293,12 @@ class DiscordCOO:
     def help_text(self) -> str:
         return (
             f"`{PREFIX} status` - session, queue, pane state\n"
+            f"`{PREFIX} cockpit` - DM cockpit summary (phase, map, next-contacts, proposals)\n"
+            f"`{PREFIX} phase` - phase plan + current phase\n"
+            f"`{PREFIX} map` - list company-map files\n"
+            f"`{PREFIX} nextcontacts` - upcoming agent-scheduled DM nudges\n"
+            f"`{PREFIX} proposals` - recent dev-gate doc-change proposals\n"
+            f"`{PREFIX} factsheet <slug>` - read a person factsheet\n"
             f"`{PREFIX} pulse` - ask the COO agent for an immediate operational check\n"
             f"`{PREFIX} send <prompt>` - admin direct prompt\n"
             f"`{PREFIX} watch` / `{PREFIX} unwatch` / `{PREFIX} home` - channel setup\n"
@@ -1962,6 +2474,7 @@ class DiscordCOO:
         close_after = CONTROL_CLOSE in text
         hold_after = CONTROL_HOLD in text
         no_action_after = CONTROL_NO_ACTION in text
+        text, next_contacts = self._record_next_contact(text)
         text = (
             text
             .replace(CONTROL_CLOSE, "")
@@ -1969,6 +2482,8 @@ class DiscordCOO:
             .replace(CONTROL_NO_ACTION, "")
             .strip()
         )
+        if next_contacts:
+            self._event("next_contacts_recorded", entries=next_contacts, source=source)
         channel_id = str(self.state.get("active_channel_id") or self.home_channel_id())
         reference = self.state.get("active_message_id")
         if ptype == "error":
