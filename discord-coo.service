@@ -1,0 +1,17 @@
+[Unit]
+Description=Discord COO Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arman
+Group=arman
+WorkingDirectory=/home/arman/workbench
+ExecStart=/home/arman/workbench/vps-skill/discord/run_discord_coo.sh
+Restart=always
+RestartSec=5
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

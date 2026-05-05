@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.discord_claudex.secrets
+*.secrets
+*.env
+.discord_coo_state/
+reference/inbox/
+reference/transcripts/
+reference/factsheets/
