@@ -25,16 +25,13 @@
 - Gradual rollout to staff under each manager, same unlock pattern.
 - Tiered access continues to be delegated by role.
 
-## Workspace layout (modular)
+## Workspace layout
 
 - `company-map/`
-  - `README.md` — modular layout rules.
-  - `org-chart.md`, `priorities.md`, `workflows.md` — company-wide content only.
-  - `factsheet-template.md`, `interview-questions.md`, `department-template.md`, `project-template.md` — starter templates.
-  - `interview-log.jsonl` — append-only record of self-scheduling decisions.
-  - `people/<slug>.md` — per-person factsheets.
-  - `departments/<slug>/` — one folder per department (`department.md`, `workflows.md`, `priorities.md`).
-  - `projects/<slug>/` — one folder per project/initiative.
+  - `org-chart.md`, `priorities.md`, `workflows.md`
+  - `factsheet-template.md`
+  - `interview-log.jsonl` — append-only record of self-scheduling decisions and bot-initiated nudges.
+  - `people/<slug>.md` — per-person factsheets following the template.
   - `access-tiers.md` — created in phase 2.
 - `reference/transcripts/` — daily Discord transcripts (still on).
 - `reference/inbox/` — inbox flagged off; not used in stage 1.
