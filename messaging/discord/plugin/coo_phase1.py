@@ -50,6 +50,21 @@ logger = logging.getLogger("coo_phase1")
 
 PASTED_INPUT_RE = re.compile(r"\[Pasted text #\d+ \+\d+ lines\]")
 COO_TO_RE = re.compile(r"\[\[COO_TO user_id=(\d+)\]\]\s*(.+?)(?=(?:\[\[COO_|$))", re.S)
+
+
+def normalize_message_text(text: str) -> str:
+    """Strip Claude Code's TUI word-wrap from a message body.
+
+    The TUI emits lines like:
+        Got it — channel manager for short-term
+         rentals, you and Adrien. Two quick ones...
+    where every continuation line is indented 1-3 spaces. Capturing the pane
+    preserves those line breaks. We need to collapse them back into prose.
+    Real paragraph breaks (blank line) are preserved.
+    """
+    paragraphs = re.split(r"\n\s*\n", text.strip())
+    cleaned = [re.sub(r"\s+", " ", p).strip() for p in paragraphs]
+    return "\n\n".join(p for p in cleaned if p)
 COO_NEXT_CONTACT_RE = re.compile(
     r"\[\[COO_NEXT_CONTACT user_id=(\d+) in_seconds=(\d+) reason=([^\]]+)\]\]"
 )
@@ -168,12 +183,13 @@ class AgentBridge:
         self._target = f"{cfg.tmux_session}:agent.0"
         self._last_response: str | None = None
 
-    def ensure_session(self) -> None:
+    def ensure_session(self) -> bool:
+        """Returns True if a new tmux session was created, False if reused."""
         cfg = self.cfg
         cfg.workdir.mkdir(parents=True, exist_ok=True)
         if self._session_exists():
-            logger.info("tmux session %s already exists", cfg.tmux_session)
-            return
+            logger.info("tmux session %s already exists; reusing", cfg.tmux_session)
+            return False
         cmd = f"cd {shlex.quote(str(cfg.workdir))} && exec {shlex.quote(cfg.run_ai)} {shlex.quote(cfg.agent_kind)}"
         subprocess.run(
             [
@@ -187,6 +203,7 @@ class AgentBridge:
         )
         logger.info("created tmux session %s", cfg.tmux_session)
         time.sleep(2.5)  # let the agent TUI initialise
+        return True
 
     def _session_exists(self) -> bool:
         return (
@@ -295,14 +312,47 @@ Anyone else's DMs are saved to an inbox you cannot see; do not address them.
 
 # Mission
 
-You are in **Phase 1 — top-down company mapping**. Your job in this phase is:
+You are in **Phase 1 — TOP-DOWN company mapping**. Phase 1 is structural,
+not staffing. Your job is to learn the SHAPE of the company from the CEO,
+not every individual employee.
 
-  1. Introduce yourself to the CEO via DM (see "How to send a DM" below).
-  2. Interview the CEO to build the company map: org chart, departments,
-     people, roles, top priorities, key workflows.
-  3. As facts emerge, write them down (later you will record them via a
-     proposal flow; for now, keep your own notes in this pane).
-  4. Self-pace your follow-ups using `[[COO_NEXT_CONTACT]]` markers.
+What to learn from the CEO in Phase 1:
+
+  1. **Departments / functional areas** (e.g. Engineering, Sales, Ops, Support).
+  2. **The manager who leads each department** — their name, role, and how
+     to reach them (Discord ID, email, or other identifier the CEO knows).
+  3. **Top company priorities right now** (the 3-5 things that matter most
+     this quarter).
+  4. **The most important workflows or processes** at company-level (3-5,
+     e.g. "how a new customer gets onboarded", "how releases ship").
+
+What NOT to ask the CEO in Phase 1:
+
+  - Do NOT ask the CEO to list or enumerate every individual employee.
+  - Do NOT ask the CEO for staff-level detail under each manager. That is
+    Phase 2 work.
+
+If a department has only the CEO + a few co-founders, that's fine — record
+them. But for any department with a real manager, your map for THAT department
+ends at "manager = Name" until Phase 2 unlocks.
+
+Phase 1 deliverables:
+  - Per-department factsheet (lead manager, top priorities, main workflows).
+  - Per-manager factsheet (name, role, department).
+  - Org chart at the company → department → manager level.
+  - Top company priorities.
+
+When the top-level map feels complete (departments + their managers + priorities
++ main workflows), STOP interviewing the CEO. Then send Dan and Adrien (the
+developers) a Phase 2 unlock proposal listing the managers you'd interview
+next, in priority order, with reasoning.
+
+Conversation operations:
+  - Self-pace your follow-ups using `[[COO_NEXT_CONTACT]]` markers.
+  - Keep messages short — Discord, not email.
+  - Plain prose, no markdown headings, no numbered checklists, no bullet lists
+    inside DMs. Discord renders bullets fine but they read like a survey form.
+    Ask one or two crisp questions per message.
 
 # How to send a DM
 
@@ -425,7 +475,7 @@ class COOBot(discord.Client):
         self.first_start_marker = cfg.state_dir / "first_start_done"
 
     async def setup_hook(self) -> None:
-        self.bridge.ensure_session()
+        self._session_was_new = self.bridge.ensure_session()
 
     async def on_ready(self) -> None:
         logger.info("Discord ready as %s (id=%s)", self.user, self.user.id if self.user else "?")
@@ -433,11 +483,15 @@ class COOBot(discord.Client):
             logger.error("No CEO row in tenant DB. Cannot proceed.")
             return
 
-        if not self.first_start_marker.exists():
+        if self._session_was_new:
+            # Fresh tmux + agent. Send full mission, mark first start.
             await self._send_initial_mission()
             self.first_start_marker.write_text(str(int(time.time())))
         else:
-            logger.info("Tenant already initialised; resuming.")
+            # Bot restarted but agent is still alive. Prime dedup so we
+            # don't re-deliver the last response, then send an amendment.
+            await asyncio.to_thread(self.bridge.latest_response)
+            await self._send_amendment()
 
         self._capture_task = asyncio.create_task(self._capture_loop())
 
@@ -445,6 +499,26 @@ class COOBot(discord.Client):
         prompt = mission_prompt(self.cfg, self.allowlist, self.ceo, self.company)
         logger.info("Sending initial mission prompt to agent")
         await asyncio.to_thread(self.bridge.send_prompt, prompt)
+
+    async def _send_amendment(self) -> None:
+        """Send a short guidance update when the bot restarts on a live agent."""
+        amendment = (
+            "[[BRIDGE_NOTICE]] The Discord listener restarted. You are still "
+            "connected; do NOT re-introduce yourself. Continue the conversation "
+            "where you left off.\n\n"
+            "Refined Phase 1 guidance:\n"
+            "  - Phase 1 maps DEPARTMENTS and the MANAGER who leads each, plus "
+            "company priorities and main workflows.\n"
+            "  - Do NOT ask the CEO to enumerate individual employees or staff "
+            "under managers. Staff get mapped in Phase 2 by interviewing each "
+            "manager directly.\n"
+            "  - Keep DM messages short, plain prose, no bullets/numbered lists "
+            "inside DMs. One or two crisp questions per message.\n\n"
+            "Acknowledge silently with NOOP and continue when the next user "
+            "message arrives."
+        )
+        logger.info("Sending mission amendment to live agent")
+        await asyncio.to_thread(self.bridge.send_prompt, amendment)
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author == self.user:
@@ -481,7 +555,7 @@ class COOBot(discord.Client):
         sent_any = False
         for m in COO_TO_RE.finditer(response):
             target_id = int(m.group(1))
-            text = m.group(2).strip()
+            text = normalize_message_text(m.group(2))
             if not text:
                 continue
             if target_id not in self.allowlist:
