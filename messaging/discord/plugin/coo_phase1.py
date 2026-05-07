@@ -181,7 +181,7 @@ class AgentBridge:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._target = f"{cfg.tmux_session}:agent.0"
-        self._last_response: str | None = None
+        self._last_response_key: str | None = None
 
     def ensure_session(self) -> bool:
         """Returns True if a new tmux session was created, False if reused."""
@@ -281,10 +281,14 @@ class AgentBridge:
 
         if not response or NOOP_RE.match(response):
             return None
-        if response == self._last_response:
+
+        # Whitespace-normalised key — TUI re-renders cause raw text to drift
+        # without the actual response changing.
+        dedup_key = re.sub(r"\s+", " ", response).strip()
+        if dedup_key == self._last_response_key:
             return None
 
-        self._last_response = response
+        self._last_response_key = dedup_key
         return response
 
 
@@ -473,6 +477,24 @@ class COOBot(discord.Client):
         self.bridge = AgentBridge(cfg)
         self._capture_task: asyncio.Task | None = None
         self.first_start_marker = cfg.state_dir / "first_start_done"
+        self._delivered_path = cfg.state_dir / "delivered.json"
+        self._last_delivered: dict[int, str] = self._load_delivered()
+
+    def _load_delivered(self) -> dict[int, str]:
+        if not self._delivered_path.exists():
+            return {}
+        try:
+            data = json.loads(self._delivered_path.read_text())
+            return {int(k): v for k, v in data.items()}
+        except Exception:
+            logger.exception("failed to load delivered.json; starting empty")
+            return {}
+
+    def _save_delivered(self) -> None:
+        try:
+            self._delivered_path.write_text(json.dumps(self._last_delivered))
+        except Exception:
+            logger.exception("failed to persist delivered.json")
 
     async def setup_hook(self) -> None:
         self._session_was_new = self.bridge.ensure_session()
@@ -564,9 +586,17 @@ class COOBot(discord.Client):
                     target_id,
                 )
                 continue
+            if self._last_delivered.get(target_id) == text:
+                logger.info(
+                    "skipping duplicate DM to uid=%s (%d chars, identical to last)",
+                    target_id, len(text),
+                )
+                continue
             try:
                 user = await self.fetch_user(target_id)
                 await user.send(text)
+                self._last_delivered[target_id] = text
+                self._save_delivered()
                 logger.info("delivered agent DM to uid=%s (%d chars)", target_id, len(text))
                 sent_any = True
             except Exception:
