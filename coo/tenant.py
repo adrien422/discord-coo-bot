@@ -165,6 +165,7 @@ def new_cmd():
     workdir = tenant_dir / "state" / "workdir"
     workdir.mkdir(parents=True, exist_ok=True)
     state_dir = tenant_dir / "state"
+    run_ai = repo_root() / "messaging" / "discord" / "plugin" / "run_ai.sh"
     secrets_file.write_text(
         f"DISCORD_CLAUDEX_BOT_TOKEN={bot_token}\n"
         f"DISCORD_COO_GUILD_ID={guild_id}\n"
@@ -178,6 +179,8 @@ def new_cmd():
         f"DISCORD_COO_WORKDIR={workdir}\n"
         f"DISCORD_COO_STATE_DIR={state_dir}\n"
         f"DISCORD_COO_TMUX_SESSION=coo_{slug}\n"
+        f"DISCORD_COO_AGENT_KIND=claude\n"
+        f"DISCORD_COO_RUN_AI={run_ai}\n"
     )
     secrets_file.chmod(0o600)
 
@@ -260,6 +263,116 @@ def start_cmd(slug: str):
     pconn.close()
 
     click.echo(f"Started {slug} (pid {proc.pid}). Log: {log_file}")
+
+
+def _check(label: str, ok: bool, detail: str = "") -> bool:
+    mark = click.style("OK  ", fg="green") if ok else click.style("FAIL", fg="red")
+    line = f"  [{mark}] {label}"
+    if detail:
+        line += f"  — {detail}"
+    click.echo(line)
+    return ok
+
+
+def _parse_env(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+@tenant_cmd.command(name="doctor")
+@click.argument("slug")
+def doctor_cmd(slug: str):
+    """Preflight checks before `coo tenant start <slug>`."""
+    import shutil
+
+    tenant = _get_tenant(slug)
+    tdir = Path(tenant["tenant_dir"])
+    secrets_file = tdir / "messaging" / "secrets.env"
+    bot_script = repo_root() / "discord_coo_bot.py"
+    tenant_db = tdir / "db" / "coo.db"
+
+    click.echo(f"Doctor for tenant {slug!r} ({tenant['company_name']})")
+    click.echo(f"Directory: {tdir}\n")
+
+    all_ok = True
+    all_ok &= _check("tenant directory exists", tdir.is_dir(), str(tdir))
+    all_ok &= _check("tenant DB present", tenant_db.is_file(), str(tenant_db))
+    all_ok &= _check(
+        "secrets.env present + mode 600",
+        secrets_file.is_file() and oct(secrets_file.stat().st_mode)[-3:] == "600",
+        f"{oct(secrets_file.stat().st_mode)[-3:] if secrets_file.exists() else 'missing'}",
+    )
+    all_ok &= _check("bot script present", bot_script.is_file(), str(bot_script))
+
+    env_vars: dict[str, str] = {}
+    if secrets_file.is_file():
+        env_vars = _parse_env(secrets_file)
+        required = [
+            "DISCORD_CLAUDEX_BOT_TOKEN",
+            "DISCORD_COO_GUILD_ID",
+            "DISCORD_COO_HOME_CHANNEL_ID",
+            "DISCORD_COO_CEO_USER_ID",
+            "DISCORD_COO_RUN_AI",
+            "DISCORD_COO_AGENT_KIND",
+            "DISCORD_COO_TMUX_SESSION",
+            "DISCORD_COO_WORKDIR",
+            "DISCORD_COO_STATE_DIR",
+        ]
+        missing = [k for k in required if not env_vars.get(k)]
+        all_ok &= _check(
+            "required env vars set",
+            not missing,
+            "missing: " + ", ".join(missing) if missing else "all present",
+        )
+
+    try:
+        import aiohttp  # noqa: F401
+        all_ok &= _check("python aiohttp importable", True)
+    except ImportError as e:
+        all_ok &= _check("python aiohttp importable", False, str(e))
+
+    tmux_path = shutil.which("tmux")
+    all_ok &= _check("tmux on PATH", bool(tmux_path), tmux_path or "not found")
+
+    run_ai = env_vars.get("DISCORD_COO_RUN_AI")
+    if run_ai:
+        rp = Path(run_ai)
+        all_ok &= _check(
+            "run_ai script exists + executable",
+            rp.is_file() and os.access(rp, os.X_OK),
+            run_ai,
+        )
+
+    agent_kind = env_vars.get("DISCORD_COO_AGENT_KIND", "claude")
+    if agent_kind == "claude":
+        bin_path = shutil.which("claude")
+        all_ok &= _check("claude binary on PATH", bool(bin_path), bin_path or "not found")
+    elif agent_kind == "codex":
+        bin_path = shutil.which("codex")
+        all_ok &= _check("codex binary on PATH", bool(bin_path), bin_path or "not found")
+
+    pid_file = tdir / "state" / "bot.pid"
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+            click.echo(f"  [{click.style('NOTE', fg='yellow')}] bot already running, pid {pid}")
+        except (OSError, ValueError):
+            click.echo(f"  [{click.style('NOTE', fg='yellow')}] stale pid file at {pid_file}")
+
+    click.echo("")
+    if all_ok:
+        click.echo(click.style("All checks passed.", fg="green"))
+        click.echo(f"Start with:  coo tenant start {slug}")
+    else:
+        click.echo(click.style("Some checks failed. Fix the items above before starting.", fg="red"))
+        sys.exit(1)
 
 
 @tenant_cmd.command(name="stop")
