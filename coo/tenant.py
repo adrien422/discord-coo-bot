@@ -171,11 +171,9 @@ def new_cmd():
         f"DISCORD_COO_GUILD_ID={guild_id}\n"
         f"DISCORD_COO_HOME_CHANNEL_ID={home_channel_id}\n"
         f"DISCORD_COO_CEO_USER_ID={ceo_discord_id}\n"
-        f"DISCORD_COO_OWNER_USER_ID={ceo_discord_id}\n"
-        f"DISCORD_COO_DM_ALLOWLIST={ceo_discord_id}\n"
-        f"DISCORD_COO_DM_ONLY=1\n"
-        f"DISCORD_COO_GROUP_FEATURES_ENABLED=0\n"
-        f"DISCORD_COO_INBOX_ENABLED=0\n"
+        f"DISCORD_COO_TENANT_SLUG={slug}\n"
+        f"DISCORD_COO_TENANT_DB={tenant_db}\n"
+        f"DISCORD_COO_PLATFORM_DB={platform_db_path()}\n"
         f"DISCORD_COO_WORKDIR={workdir}\n"
         f"DISCORD_COO_STATE_DIR={state_dir}\n"
         f"DISCORD_COO_TMUX_SESSION=coo_{slug}\n"
@@ -221,7 +219,7 @@ def start_cmd(slug: str):
     tenant = _get_tenant(slug)
     tdir = Path(tenant["tenant_dir"])
     secrets_file = tdir / "messaging" / "secrets.env"
-    bot_script = repo_root() / "discord_coo_bot.py"
+    bot_script = repo_root() / "messaging" / "discord" / "plugin" / "coo_phase1.py"
     pid_file = tdir / "state" / "bot.pid"
     log_file = tdir / "state" / "bot.log"
 
@@ -294,7 +292,7 @@ def doctor_cmd(slug: str):
     tenant = _get_tenant(slug)
     tdir = Path(tenant["tenant_dir"])
     secrets_file = tdir / "messaging" / "secrets.env"
-    bot_script = repo_root() / "discord_coo_bot.py"
+    bot_script = repo_root() / "messaging" / "discord" / "plugin" / "coo_phase1.py"
     tenant_db = tdir / "db" / "coo.db"
 
     click.echo(f"Doctor for tenant {slug!r} ({tenant['company_name']})")
@@ -318,6 +316,9 @@ def doctor_cmd(slug: str):
             "DISCORD_COO_GUILD_ID",
             "DISCORD_COO_HOME_CHANNEL_ID",
             "DISCORD_COO_CEO_USER_ID",
+            "DISCORD_COO_TENANT_SLUG",
+            "DISCORD_COO_TENANT_DB",
+            "DISCORD_COO_PLATFORM_DB",
             "DISCORD_COO_RUN_AI",
             "DISCORD_COO_AGENT_KIND",
             "DISCORD_COO_TMUX_SESSION",
@@ -336,6 +337,12 @@ def doctor_cmd(slug: str):
         all_ok &= _check("python aiohttp importable", True)
     except ImportError as e:
         all_ok &= _check("python aiohttp importable", False, str(e))
+
+    try:
+        import discord  # noqa: F401
+        all_ok &= _check("python discord.py importable", True, f"v{discord.__version__}")
+    except ImportError as e:
+        all_ok &= _check("python discord.py importable", False, str(e))
 
     tmux_path = shutil.which("tmux")
     all_ok &= _check("tmux on PATH", bool(tmux_path), tmux_path or "not found")
