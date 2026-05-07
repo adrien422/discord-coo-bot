@@ -50,6 +50,13 @@ logger = logging.getLogger("coo_phase1")
 
 PASTED_INPUT_RE = re.compile(r"\[Pasted text #\d+ \+\d+ lines\]")
 COO_TO_RE = re.compile(r"\[\[COO_TO user_id=(\d+)\]\]\s*(.+?)(?=(?:\[\[COO_|$))", re.S)
+COO_FIND_MEMBER_RE = re.compile(r"\[\[COO_FIND_MEMBER query=([^\]]+)\]\]")
+
+
+TUI_ARTIFACT_RE = re.compile(
+    r"⎿\s*Interrupted.*?(?:What should Claude do instead\?|$)",
+    re.S,
+)
 
 
 def normalize_message_text(text: str) -> str:
@@ -60,8 +67,11 @@ def normalize_message_text(text: str) -> str:
          rentals, you and Adrien. Two quick ones...
     where every continuation line is indented 1-3 spaces. Capturing the pane
     preserves those line breaks. We need to collapse them back into prose.
-    Real paragraph breaks (blank line) are preserved.
+    Real paragraph breaks (blank line) are preserved. Strips any TUI control
+    artifacts that bleed in (e.g. "⎿ Interrupted · What should Claude do
+    instead?").
     """
+    text = TUI_ARTIFACT_RE.sub("", text)
     paragraphs = re.split(r"\n\s*\n", text.strip())
     cleaned = [re.sub(r"\s+", " ", p).strip() for p in paragraphs]
     return "\n\n".join(p for p in cleaned if p)
@@ -214,21 +224,26 @@ class AgentBridge:
             == 0
         )
 
-    def send_prompt(self, text: str) -> None:
+    def send_prompt(self, text: str, cancel_first: bool = False) -> None:
         """Type text into the agent pane and submit it.
 
         Claude Code uses bracketed-paste mode; sending Enter immediately after
         a multi-line paste gets absorbed by the paste sequence. We send the
         text, sleep, send Enter (closes paste), sleep, send Enter (submits).
+
+        cancel_first=True sends Escape first to cancel any modal/partial input.
+        Use ONLY for top-level interrupting events (initial mission). Avoid
+        for bridge feedback while Claude may be mid-response — Escape will
+        truncate the in-flight reply.
         """
         if not self._session_exists():
             raise RuntimeError("tmux session is gone; cannot send prompt")
-        # Cancel any pending modal / partial input.
-        subprocess.run(
-            ["tmux", "send-keys", "-t", self._target, "Escape"],
-            timeout=5, check=False,
-        )
-        time.sleep(0.15)
+        if cancel_first:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", self._target, "Escape"],
+                timeout=5, check=False,
+            )
+            time.sleep(0.15)
         subprocess.run(
             ["tmux", "send-keys", "-t", self._target, "-l", text],
             timeout=20, check=True,
@@ -297,13 +312,16 @@ class AgentBridge:
 
 def mission_prompt(cfg: Config, allowlist: dict[int, dict], ceo: dict, company_name: str) -> str:
     devs = [v for v in allowlist.values() if v["role"] == "developer"]
-    dev_lines = "\n".join(f"  - {d['name']} ({d['handle']}, developer)" for d in devs) or "  (none registered)"
+    dev_lines = "\n".join(f"  - {d['name']} ({d['handle']}, developer, role=developer)" for d in devs) or "  (none registered)"
+    dev_ids_csv = ", ".join(
+        str(uid) for uid, v in allowlist.items() if v["role"] == "developer"
+    )
 
     return f"""You are the persistent COO agent for **{company_name}**.
 
 Your conversation surface is Discord (this session is bridged to it via tmux).
-The Discord listener forwards any DM from an allowlisted person to you, and
-relays anything you say in this pane back to them.
+The listener forwards DMs from allowlisted people to you and relays anything
+you emit between [[…]] markers back to them.
 
 # Allowlist (Phase 1)
 
@@ -312,51 +330,109 @@ You may converse with these people only:
   - {ceo['display_name']} (Discord user_id={cfg.ceo_user_id}, role: {ceo.get('role') or 'CEO'}, content authority for {company_name})
 {dev_lines}
 
-Anyone else's DMs are saved to an inbox you cannot see; do not address them.
+Anyone else's DMs are silently saved to an inbox you cannot see — do not
+address them.
 
-# Mission
+# Phase 1 — explicit deliverables checklist
 
-You are in **Phase 1 — TOP-DOWN company mapping**. Phase 1 is structural,
-not staffing. Your job is to learn the SHAPE of the company from the CEO,
-not every individual employee.
+Phase 1 is **structural** mapping with the CEO. You CANNOT exit Phase 1
+until every box below is filled. Track progress in your **internal notes**
+(plain text, NO `[[COO_TO]]` prefix — those are not sent to anyone).
+Refer back to the checklist as you interview.
 
-What to learn from the CEO in Phase 1:
+  [ ] Departments / functional areas — names + brief description each.
+  [ ] For each department: manager name + **confirmed Discord user_id**
+        (or explicit "CEO covers, no separate manager"). Use the
+        member-search marker (below) to confirm IDs as soon as a name is
+        mentioned. Do NOT exit Phase 1 with unconfirmed managers.
+  [ ] Top 3–5 **company priorities this quarter**, with brief reasoning.
+  [ ] Top 3–5 **recurring workflows** at company level (onboarding,
+        support, billing, releases, …).
+  [ ] **Tools / apps** in use, grouped by the workflow they support
+        (CRM, support, billing, comms, dev, etc.).
+  [ ] Top 3 **risks** the CEO is worried about right now.
+  [ ] Significant **decisions made in the last ~90 days**, with rationale.
+  [ ] **Headcount + open roles** (target start dates if known).
+  [ ] What "good" looks like 6 months out — CEO's own success criteria.
 
-  1. **Departments / functional areas** (e.g. Engineering, Sales, Ops, Support).
-  2. **The manager who leads each department** — their name, role, and how
-     to reach them (Discord ID, email, or other identifier the CEO knows).
-  3. **Top company priorities right now** (the 3-5 things that matter most
-     this quarter).
-  4. **The most important workflows or processes** at company-level (3-5,
-     e.g. "how a new customer gets onboarded", "how releases ship").
+Do NOT ask the CEO to list individual employees. Staff under each manager
+is Phase 2 work.
 
-What NOT to ask the CEO in Phase 1:
+# Finding a Discord member by name
 
-  - Do NOT ask the CEO to list or enumerate every individual employee.
-  - Do NOT ask the CEO for staff-level detail under each manager. That is
-    Phase 2 work.
+When the CEO names a manager (e.g. "Carlos leads sales"), do NOT just
+write "Carlos" to your map and move on. Find them on Discord first by
+emitting:
 
-If a department has only the CEO + a few co-founders, that's fine — record
-them. But for any department with a real manager, your map for THAT department
-ends at "manager = Name" until Phase 2 unlocks.
+    [[COO_FIND_MEMBER query=Carlos]]
 
-Phase 1 deliverables:
-  - Per-department factsheet (lead manager, top priorities, main workflows).
-  - Per-manager factsheet (name, role, department).
-  - Org chart at the company → department → manager level.
-  - Top company priorities.
+The bridge will reply with `[[BRIDGE_FIND_RESULT query="Carlos"]]` and a
+list of matching guild members (display name, username, discord_user_id).
+Then offer the candidates back to the CEO and ask which one is the right
+person. Once confirmed, save the user_id in your notes alongside that
+manager record. If no match is found, ask the CEO for the manager's email
+or other contact info.
 
-When the top-level map feels complete (departments + their managers + priorities
-+ main workflows), STOP interviewing the CEO. Then send Dan and Adrien (the
-developers) a Phase 2 unlock proposal listing the managers you'd interview
-next, in priority order, with reasoning.
+# How to send a DM
 
-Conversation operations:
-  - Self-pace your follow-ups using `[[COO_NEXT_CONTACT]]` markers.
-  - Keep messages short — Discord, not email.
-  - Plain prose, no markdown headings, no numbered checklists, no bullet lists
-    inside DMs. Discord renders bullets fine but they read like a survey form.
-    Ask one or two crisp questions per message.
+To send a DM to anyone in the allowlist:
+
+    [[COO_TO user_id=<discord_user_id>]] <your message text>
+
+Plain text WITHOUT a `[[COO_TO ...]]` prefix is internal notes and is
+NOT sent to anyone — use plain text to track checklist progress, draft
+factsheets, or think out loud.
+
+# Self-pacing
+
+After each meaningful exchange, schedule the next follow-up:
+
+    [[COO_NEXT_CONTACT user_id=<id> in_seconds=<int> reason=<short>]]
+
+The bridge schedules the nudge and re-prompts you at that time. Do not
+spawn new sessions.
+
+# DM style
+
+Discord, not email. One or two crisp questions per message, plain prose,
+no markdown headings, no bullets, no numbered lists inside DMs. The CEO
+reads on a phone — treat each message as a 5-second read. Work the
+checklist one or two boxes at a time across many messages, not all at
+once.
+
+# Markers
+
+  - `[[COO_TO user_id=N]] <text>` — DM to that user
+  - `[[COO_FIND_MEMBER query=<name>]]` — search Discord guild for a person
+  - `[[COO_NEXT_CONTACT user_id=N in_seconds=I reason=R]]` — schedule a follow-up
+  - `[[COO_CLOSE]]` — close the current DM thread
+  - `[[COO_HOLD]]` — park the thread without action
+  - `NOOP` — valid full reply when there is nothing to do
+
+# Hard rules
+
+  - Do not reveal tokens, credentials, or any content of secrets files.
+  - Do not hire, fire, set comp, sign contracts, or commit budget.
+  - Phase 2 (managers) and Phase 3 (staff) are LOCKED. Only the developers
+    (user_ids: {dev_ids_csv}) can unlock them. The CEO cannot.
+  - **Do NOT use the auto-memory / Claude Code memory tool**. Memory is
+    not yet isolated per tenant on this VM, so reading or writing it
+    can mix data across companies. Track everything in this pane and
+    in the company-map files only. If you find yourself reaching for
+    "recall a memory" or "save a memory", stop — the conversation pane
+    IS your memory for this session.
+
+# Phase 1 exit gate
+
+When ALL checklist boxes are filled AND every named manager has a
+confirmed Discord user_id (or "no separate manager" is explicit) AND the
+CEO has reviewed and confirmed the org-chart factsheet you produced, THEN
+DM each developer with the Phase 2 unlock proposal:
+
+    [[COO_TO user_id=<dev_id>]] Phase 1 complete for {company_name}. Proposing Phase 2 unlock — managers to interview, in priority order: 1) <name> (<dept>, <reason>), 2) ..., 3) .... Approve to expand the allowlist?
+
+Wait for both developers to acknowledge before treating Phase 2 as
+unlocked.
 
 # How to send a DM
 
@@ -398,9 +474,12 @@ The bridge schedules the nudge and re-prompts you at the right time.
 
 # First action
 
-The CEO has not yet heard from you. Your first action in this session is to
-DM the CEO with a short, warm introduction (1-3 sentences) and a single
-opening question to start the company map. Use the `[[COO_TO user_id={cfg.ceo_user_id}]]` form.
+The CEO has not yet heard from you. Your first action in this session is
+to DM the CEO with a short, warm introduction (1-2 sentences) and the
+FIRST checklist question — usually about departments / functional areas.
+Do not dump the whole checklist on them; work through it one or two items
+per message across many messages. Use the
+`[[COO_TO user_id={cfg.ceo_user_id}]]` form.
 """
 
 
@@ -479,6 +558,7 @@ class COOBot(discord.Client):
         self.first_start_marker = cfg.state_dir / "first_start_done"
         self._delivered_path = cfg.state_dir / "delivered.json"
         self._last_delivered: dict[int, str] = self._load_delivered()
+        self._send_lock = asyncio.Lock()
 
     def _load_delivered(self) -> dict[int, str]:
         if not self._delivered_path.exists():
@@ -495,6 +575,11 @@ class COOBot(discord.Client):
             self._delivered_path.write_text(json.dumps(self._last_delivered))
         except Exception:
             logger.exception("failed to persist delivered.json")
+
+    async def _send_to_agent(self, text: str, cancel_first: bool = False) -> None:
+        """Serialised paste into Claude's pane; prevents concurrent paste collisions."""
+        async with self._send_lock:
+            await asyncio.to_thread(self.bridge.send_prompt, text, cancel_first)
 
     async def setup_hook(self) -> None:
         self._session_was_new = self.bridge.ensure_session()
@@ -520,7 +605,7 @@ class COOBot(discord.Client):
     async def _send_initial_mission(self) -> None:
         prompt = mission_prompt(self.cfg, self.allowlist, self.ceo, self.company)
         logger.info("Sending initial mission prompt to agent")
-        await asyncio.to_thread(self.bridge.send_prompt, prompt)
+        await self._send_to_agent(prompt, cancel_first=True)
 
     async def _send_amendment(self) -> None:
         """Send a short guidance update when the bot restarts on a live agent."""
@@ -540,7 +625,7 @@ class COOBot(discord.Client):
             "message arrives."
         )
         logger.info("Sending mission amendment to live agent")
-        await asyncio.to_thread(self.bridge.send_prompt, amendment)
+        await self._send_to_agent(amendment, cancel_first=False)
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author == self.user:
@@ -555,7 +640,7 @@ class COOBot(discord.Client):
             sender = self.allowlist[sender_id]
             logger.info("DM from allowlisted %s (uid=%s)", sender["name"], sender_id)
             prompt = relay_prompt(sender, sender_id, content)
-            await asyncio.to_thread(self.bridge.send_prompt, prompt)
+            await self._send_to_agent(prompt, cancel_first=False)
         else:
             logger.info("DM from non-allowlist user %s (uid=%s) -> inbox", message.author.name, sender_id)
             save_inbox_item(self.cfg, message.author, content, message.id, message.channel.id)
@@ -606,8 +691,73 @@ class COOBot(discord.Client):
             uid, secs, reason = int(m.group(1)), int(m.group(2)), m.group(3).strip()
             self._record_scheduled_contact(uid, secs, reason)
 
-        if not sent_any and not COO_NEXT_CONTACT_RE.search(response):
-            logger.debug("agent reply with no COO_TO markers (internal note)")
+        queries = [
+            m.group(1).strip().strip('"').strip("'")
+            for m in COO_FIND_MEMBER_RE.finditer(response)
+        ]
+        if queries:
+            asyncio.create_task(self._handle_find_members_batch(queries))
+
+        if not sent_any and not COO_NEXT_CONTACT_RE.search(response) and not queries:
+            logger.debug("agent reply with no actionable markers (internal note)")
+
+    async def _handle_find_members_batch(self, queries: list[str]) -> None:
+        # Wait briefly so any in-flight CEO reply finishes composing before we
+        # paste the bridge response back into Claude's input.
+        await asyncio.sleep(8)
+
+        guild = self.get_guild(self.cfg.guild_id)
+        if guild is None:
+            try:
+                guild = await self.fetch_guild(self.cfg.guild_id)
+            except Exception:
+                logger.exception("could not fetch guild %s", self.cfg.guild_id)
+                guild = None
+
+        results: list[tuple[str, list]] = []
+        for q in queries:
+            members: list = []
+            if guild is not None:
+                try:
+                    members = await guild.query_members(query=q, limit=10)
+                except Exception:
+                    logger.exception("query_members failed for %r", q)
+                if not members:
+                    qlow = q.lower()
+                    members = [
+                        m for m in guild.members
+                        if qlow in (m.display_name or "").lower()
+                        or qlow in (m.name or "").lower()
+                        or qlow in (m.global_name or "").lower()
+                    ][:10]
+            logger.info("returning %d member match(es) for %r", len(members), q)
+            results.append((q, members))
+
+        sections = []
+        for q, members in results:
+            if not members:
+                sections.append(
+                    f'query "{q}": no match in the guild. Ask the CEO for an '
+                    f"email or other contact; record the name without a Discord ID."
+                )
+            else:
+                lines = [
+                    f"  - {m.display_name or m.name} (@{m.name}, discord_user_id={m.id})"
+                    for m in members
+                ]
+                sections.append(
+                    f'query "{q}": {len(members)} match(es)\n' + "\n".join(lines)
+                )
+
+        notice = (
+            "[[BRIDGE_FIND_RESULT]]\n\n"
+            + "\n\n".join(sections)
+            + "\n\nFor each query: confirm with the CEO which discord_user_id "
+            "matches the manager they named. Save the confirmed user_id beside "
+            "the manager's record. Reply NOOP if you have nothing else to say "
+            "right now; otherwise continue your reply to the CEO."
+        )
+        await self._send_to_agent(notice, cancel_first=False)
 
     def _record_scheduled_contact(self, uid: int, secs: int, reason: str) -> None:
         tconn = _connect(self.cfg.tenant_db)
