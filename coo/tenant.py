@@ -382,6 +382,99 @@ def doctor_cmd(slug: str):
         sys.exit(1)
 
 
+@tenant_cmd.command(name="add-person")
+@click.argument("slug")
+def add_person_cmd(slug: str):
+    """Add a person (manager, employee, etc.) to a tenant — widens the allowlist.
+
+    Use this when the agent's Phase 2 unlock proposal has been approved and
+    the operator (Dan or Adrien) wants to make a new manager DM-reachable.
+    The bot picks up the new person on its next inbound message — no restart
+    needed.
+    """
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    if not tenant_db.exists():
+        click.echo(f"Tenant DB missing at {tenant_db}", err=True)
+        sys.exit(1)
+
+    click.echo(f"--- Adding person to tenant {slug!r} ({tenant['company_name']}) ---")
+    display_name = click.prompt("Display name").strip()
+    discord_user_id_raw = click.prompt("Discord user ID").strip()
+    if not discord_user_id_raw.isdigit():
+        click.echo("Discord user ID must be numeric.", err=True)
+        sys.exit(1)
+    discord_user_id = int(discord_user_id_raw)
+    role = click.prompt(
+        "Role (e.g. 'head of sales', or blank)", default="", show_default=False
+    ).strip()
+    team_slug = click.prompt(
+        "Team slug (e.g. 'sales'; blank for none)", default="", show_default=False
+    ).strip()
+    access_tier = click.prompt(
+        "Access tier",
+        type=click.Choice(["admin", "strategic", "manager", "employee"]),
+        default="manager",
+    )
+    is_content_approver_raw = click.prompt(
+        "Also mark as content approver? (y/n)", default="n"
+    ).strip().lower()
+    is_content_approver = 1 if is_content_approver_raw.startswith("y") else 0
+
+    person_slug = _slug_for_name(display_name)
+
+    conn = connect(tenant_db)
+    try:
+        existing = conn.execute(
+            "SELECT id, slug, display_name FROM people WHERE discord_user_id = ?",
+            (discord_user_id,),
+        ).fetchone()
+        if existing:
+            click.echo(
+                f"A person with Discord ID {discord_user_id} already exists: "
+                f"'{existing['display_name']}' (slug={existing['slug']}). Aborting.",
+                err=True,
+            )
+            sys.exit(1)
+
+        with transaction(conn):
+            team_id = None
+            if team_slug:
+                team_row = conn.execute(
+                    "SELECT id FROM teams WHERE slug = ?", (team_slug,)
+                ).fetchone()
+                if team_row:
+                    team_id = team_row["id"]
+                else:
+                    team_name = team_slug.replace("-", " ").title()
+                    cur = conn.execute(
+                        "INSERT INTO teams (slug, name) VALUES (?, ?)",
+                        (team_slug, team_name),
+                    )
+                    team_id = cur.lastrowid
+                    click.echo(f"  created team '{team_slug}' ({team_name})")
+
+            conn.execute(
+                "INSERT INTO people (slug, display_name, discord_user_id, role, "
+                "  team_id, access_tier, is_content_approver) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    person_slug, display_name, discord_user_id,
+                    role or None, team_id, access_tier, is_content_approver,
+                ),
+            )
+    finally:
+        conn.close()
+
+    click.echo("")
+    click.echo(f"Added {display_name} (slug={person_slug}, tier={access_tier}).")
+    click.echo(
+        "The bot reloads its allowlist on every message, so they're reachable "
+        "as soon as someone DMs the bot (or the agent's next outbound DM)."
+    )
+
+
 @tenant_cmd.command(name="stop")
 @click.argument("slug")
 def stop_cmd(slug: str):

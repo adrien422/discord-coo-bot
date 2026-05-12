@@ -137,9 +137,13 @@ def _connect(db: Path) -> sqlite3.Connection:
 
 
 def load_allowlist(cfg: Config) -> dict[int, dict]:
-    """Allowlist = platform developers + tenant CEO + tenant content_approvers.
+    """Allowlist = platform developers + ALL tenant.people with Discord IDs.
 
-    Returns a map: discord_user_id -> {handle, name, role}
+    Phase enforcement is at insert-time, not lookup-time: the wizard only
+    inserts the CEO in Phase 1; `coo tenant add-person` adds managers in
+    Phase 2; staff in Phase 3. So the allowlist naturally grows.
+
+    Returns a map: discord_user_id -> {handle, name, role, tier}
     """
     out: dict[int, dict] = {}
 
@@ -152,20 +156,22 @@ def load_allowlist(cfg: Config) -> dict[int, dict]:
             "handle": r["handle"],
             "name": r["display_name"],
             "role": "developer",
+            "tier": "developer",
         }
     pconn.close()
 
     tconn = _connect(cfg.tenant_db)
     for r in tconn.execute(
-        "SELECT discord_user_id, slug, display_name, role, is_content_approver "
+        "SELECT discord_user_id, slug, display_name, role, access_tier, "
+        "       is_content_approver "
         "FROM people WHERE deleted_at IS NULL AND discord_user_id IS NOT NULL"
     ).fetchall():
-        if r["is_content_approver"] or int(r["discord_user_id"]) == cfg.ceo_user_id:
-            out[int(r["discord_user_id"])] = {
-                "handle": r["slug"],
-                "name": r["display_name"],
-                "role": r["role"] or "ceo",
-            }
+        out[int(r["discord_user_id"])] = {
+            "handle": r["slug"],
+            "name": r["display_name"],
+            "role": r["role"] or ("ceo" if int(r["discord_user_id"]) == cfg.ceo_user_id else "member"),
+            "tier": r["access_tier"],
+        }
     tconn.close()
     return out
 
@@ -843,6 +849,10 @@ class COOBot(discord.Client):
         sender_id = message.author.id
         content = message.content or ""
 
+        # Reload allowlist from DB on every message so that `coo tenant
+        # add-person` lands without a restart.
+        self.allowlist = await asyncio.to_thread(load_allowlist, self.cfg)
+
         if sender_id in self.allowlist:
             sender = self.allowlist[sender_id]
             logger.info("DM from allowlisted %s (uid=%s)", sender["name"], sender_id)
@@ -875,6 +885,8 @@ class COOBot(discord.Client):
             await asyncio.sleep(2)
 
     async def _dispatch_response(self, response: str) -> None:
+        # Reload allowlist so newly-added managers can be the agent's DM target.
+        self.allowlist = await asyncio.to_thread(load_allowlist, self.cfg)
         sent_any = False
         for m in COO_TO_RE.finditer(response):
             target_id = int(m.group(1))
