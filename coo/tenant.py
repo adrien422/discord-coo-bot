@@ -475,6 +475,78 @@ def add_person_cmd(slug: str):
     )
 
 
+DEFAULT_CADENCES = [
+    # (slug, name, kind, cron_expr_utc, scope_kind)
+    ("daily-brief",         "Daily CEO brief",        "daily-brief",         "0 9 * * *",         "company"),
+    ("weekly-pulse",        "Weekly commitments",     "weekly-pulse",        "0 9 * * MON",       "company"),
+    ("monthly-review",      "Monthly KPI review",     "monthly-review",      "0 9 1 * *",         "company"),
+    ("quarterly-okr-grade", "Quarterly OKR grading",  "quarterly-okr-grade", "0 9 1 1,4,7,10 *",  "company"),
+    ("factsheet-refresh",   "Factsheet refresh",      "factsheet-refresh",   "0 6 * * SUN",       "company"),
+    ("risk-review",         "Risk register review",   "risk-review",         "0 10 1 * *",        "company"),
+]
+
+
+@tenant_cmd.command(name="seed-cadences")
+@click.argument("slug")
+def seed_cadences_cmd(slug: str):
+    """Insert default operating cadences into the tenant.
+
+    Cadences are the proactive operating rhythm — daily briefs, weekly
+    commitment pulses, monthly KPI reviews, quarterly OKR grading, etc.
+    The bot's cadence loop fires due rows and prompts the agent to act.
+    Cron expressions are UTC. Already-present cadences (by slug) are skipped.
+    """
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    if not tenant_db.exists():
+        click.echo(f"Tenant DB missing at {tenant_db}", err=True)
+        sys.exit(1)
+
+    try:
+        from croniter import croniter
+    except ImportError:
+        click.echo(
+            "croniter missing. Install: pip install --user --break-system-packages croniter",
+            err=True,
+        )
+        sys.exit(1)
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
+    inserted = 0
+    skipped = 0
+    conn = connect(tenant_db)
+    try:
+        with transaction(conn):
+            for slug_, name, kind, cron_expr, scope_kind in DEFAULT_CADENCES:
+                existing = conn.execute(
+                    "SELECT id FROM cadences WHERE slug = ?", (slug_,)
+                ).fetchone()
+                if existing:
+                    skipped += 1
+                    click.echo(f"  = {slug_} (already exists)")
+                    continue
+                next_at = (
+                    croniter(cron_expr, now).get_next(datetime)
+                    .strftime("%Y-%m-%d %H:%M:%S")
+                )
+                conn.execute(
+                    "INSERT INTO cadences (slug, name, kind, scope_kind, "
+                    "  cron_expr, next_fire_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (slug_, name, kind, scope_kind, cron_expr, next_at),
+                )
+                inserted += 1
+                click.echo(f"  + {slug_} (next fire {next_at} UTC)")
+    finally:
+        conn.close()
+
+    click.echo("")
+    click.echo(f"Cadences seeded: inserted={inserted}, skipped={skipped}.")
+
+
 @tenant_cmd.command(name="stop")
 @click.argument("slug")
 def stop_cmd(slug: str):

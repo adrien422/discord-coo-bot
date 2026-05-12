@@ -90,6 +90,55 @@ COO_CLOSE_RE = re.compile(r"\[\[COO_CLOSE\]\]")
 NOOP_RE = re.compile(r"^\s*●?\s*NOOP\s*$", re.M)
 
 
+# Per-kind agent instructions emitted when a cadence fires.
+CADENCE_INSTRUCTIONS = {
+    "daily-brief": (
+        "Daily brief: scan today's open commitments, overdue items, and "
+        "anything new since yesterday. Compose ONE short DM to the CEO with "
+        "the 1–2 things most worth knowing today. Skip (reply NOOP) if "
+        "nothing is genuinely notable — silence is OK."
+    ),
+    "weekly-pulse": (
+        "Weekly commitment pulse: look at all open commitments in the DB "
+        "(query mentally via what you've recorded). For each that's due in "
+        "the next 7 days or already overdue, DM the owner asking a single "
+        "crisp status question. As replies come back, record outcomes via "
+        "[[COO_FACT subject=\"<user_id>\" predicate=\"commitment_status\" "
+        "object=\"...\"]]. Add [[COO_NEXT_CONTACT]] markers to chase the "
+        "ones still open."
+    ),
+    "monthly-review": (
+        "Monthly review: look at recent metric_values, surface anomalies "
+        "(misses, big drops) and one or two follow-ups the leadership team "
+        "should take. DM the CEO with the headline numbers + the one "
+        "decision you'd ask them to make. Record any decisions reached via "
+        "[[COO_FACT subject=\"company\" predicate=\"decision\" "
+        "object=\"...\"]]."
+    ),
+    "quarterly-okr-grade": (
+        "Quarterly OKR grading: for each OKR ending this quarter, propose a "
+        "grade (0.0–1.0) and short rationale. DM the OKR owner asking for "
+        "their own grade and any narrative. Record the final grade via "
+        "[[COO_FACT subject=\"<scope>\" predicate=\"okr_grade\" "
+        "object=\"<period>:<grade> – <rationale>\"]]."
+    ),
+    "factsheet-refresh": (
+        "Factsheet refresh: regenerate per-person and per-team factsheets "
+        "from the latest facts in the DB. Write them to the company-map "
+        "directory under the agent's workdir. No DMs to anyone unless "
+        "something blocks you."
+    ),
+    "risk-review": (
+        "Risk register review: list all open risks whose last_reviewed_at "
+        "is older than their review_cadence (or NULL). For each, DM the "
+        "owner asking whether mitigation is on track, status changed, or "
+        "the risk can be closed. Update the risk via "
+        "[[COO_FACT subject=\"company\" predicate=\"risk_status\" "
+        "object=\"<slug>:<status>\"]]."
+    ),
+}
+
+
 @dataclass
 class Config:
     bot_token: str
@@ -574,6 +623,7 @@ class COOBot(discord.Client):
         self.bridge = AgentBridge(cfg)
         self._capture_task: asyncio.Task | None = None
         self._schedule_task: asyncio.Task | None = None
+        self._cadence_task: asyncio.Task | None = None
         self.first_start_marker = cfg.state_dir / "first_start_done"
         self._delivered_path = cfg.state_dir / "delivered.json"
         self._last_delivered: dict[int, str] = self._load_delivered()
@@ -814,6 +864,7 @@ class COOBot(discord.Client):
 
         self._capture_task = asyncio.create_task(self._capture_loop())
         self._schedule_task = asyncio.create_task(self._schedule_loop())
+        self._cadence_task = asyncio.create_task(self._cadence_loop())
 
     async def _send_initial_mission(self) -> None:
         prompt = mission_prompt(self.cfg, self.allowlist, self.ceo, self.company)
@@ -1029,6 +1080,115 @@ class COOBot(discord.Client):
             "matches the manager they named. Save the confirmed user_id beside "
             "the manager's record. Reply NOOP if you have nothing else to say "
             "right now; otherwise continue your reply to the CEO."
+        )
+        await self._send_to_agent(notice, cancel_first=False)
+
+    # ----- operating cadences (proactive rhythm) -----
+
+    async def _cadence_loop(self) -> None:
+        """Every 60s, fire any cadences whose next_fire_at has elapsed."""
+        await asyncio.sleep(30)  # offset from schedule_loop so they don't sync-storm
+        while not self.is_closed():
+            try:
+                await self._fire_due_cadences()
+            except Exception:
+                logger.exception("cadence loop error")
+            await asyncio.sleep(60)
+
+    async def _fire_due_cadences(self) -> None:
+        rows = await asyncio.to_thread(self._claim_due_cadences)
+        for row in rows:
+            await self._send_cadence_to_agent(row)
+            await asyncio.to_thread(self._close_cadence_run, row["run_id"])
+
+    def _claim_due_cadences(self) -> list[dict]:
+        """Atomically pick due cadences, compute next fire, open a run row."""
+        try:
+            from croniter import croniter as _croniter
+        except ImportError:
+            return []
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            with conn:
+                rows = conn.execute(
+                    "SELECT id, slug, name, kind, scope_kind, scope_id, cron_expr "
+                    "FROM cadences "
+                    "WHERE is_active = 1 "
+                    "  AND (next_fire_at IS NULL OR next_fire_at <= datetime('now')) "
+                    "ORDER BY next_fire_at IS NULL DESC, next_fire_at ASC "
+                    "LIMIT 3"
+                ).fetchall()
+                claimed: list[dict] = []
+                for r in rows:
+                    try:
+                        next_at = (
+                            _croniter(r["cron_expr"], now).get_next(datetime)
+                            .strftime("%Y-%m-%d %H:%M:%S")
+                        )
+                    except Exception:
+                        logger.exception("bad cron_expr for cadence %s", r["slug"])
+                        next_at = None
+                    conn.execute(
+                        "UPDATE cadences "
+                        "SET last_fired_at = datetime('now'), next_fire_at = ? "
+                        "WHERE id = ?",
+                        (next_at, r["id"]),
+                    )
+                    cur = conn.execute(
+                        "INSERT INTO cadence_runs (cadence_id, started_at, status) "
+                        "VALUES (?, datetime('now'), 'running')",
+                        (r["id"],),
+                    )
+                    conn.execute(
+                        "INSERT INTO audit_log (actor_kind, action, target_kind, "
+                        "  target_id, payload_json) "
+                        "VALUES ('system', 'cadence_fired', 'cadence', ?, ?)",
+                        (r["id"], json.dumps({"slug": r["slug"], "kind": r["kind"]})),
+                    )
+                    row = dict(r)
+                    row["run_id"] = cur.lastrowid
+                    claimed.append(row)
+            return claimed
+        finally:
+            conn.close()
+
+    def _close_cadence_run(self, run_id: int) -> None:
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE cadence_runs "
+                    "SET finished_at = datetime('now'), status = 'succeeded' "
+                    "WHERE id = ?",
+                    (run_id,),
+                )
+        finally:
+            conn.close()
+
+    async def _send_cadence_to_agent(self, row: dict) -> None:
+        kind = row["kind"]
+        instructions = CADENCE_INSTRUCTIONS.get(
+            kind,
+            "Take whatever action this cadence is for, based on the kind name.",
+        )
+        notice = (
+            f"[[BRIDGE_CADENCE run_id={row['run_id']} kind={kind} "
+            f"scope={row['scope_kind']}]]\n\n"
+            f"A scheduled operating cadence has fired.\n"
+            f"  - Cadence: {row['name']} (slug={row['slug']})\n"
+            f"  - Kind:    {kind}\n"
+            f"  - Scope:   {row['scope_kind']}\n\n"
+            f"{instructions}\n\n"
+            "Take whatever action is appropriate now (DMs, [[COO_FACT]] / "
+            "[[COO_COMMITMENT]] markers to record results, [[COO_NEXT_CONTACT]] "
+            "to chase later). Reply NOOP if there's nothing to do this cycle."
+        )
+        logger.info(
+            "firing cadence slug=%s kind=%s run_id=%s",
+            row["slug"], kind, row["run_id"],
         )
         await self._send_to_agent(notice, cancel_first=False)
 
