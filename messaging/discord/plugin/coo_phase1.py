@@ -294,7 +294,13 @@ class AgentBridge:
         response = tail[: cut.start() if cut else len(tail)]
         response = re.sub(r"^●\s*", "", response).strip()
 
-        if not response or NOOP_RE.match(response):
+        if not response:
+            return None
+
+        # Suppress only if the entire response is just NOOP. A response that
+        # CONTAINS NOOP at the top but also chains a [[COO_NEXT_CONTACT]] or
+        # other marker still needs to be dispatched so the marker is captured.
+        if response.strip() == "NOOP":
             return None
 
         # Whitespace-normalised key — TUI re-renders cause raw text to drift
@@ -567,6 +573,7 @@ class COOBot(discord.Client):
         self.company = load_company_name(cfg)
         self.bridge = AgentBridge(cfg)
         self._capture_task: asyncio.Task | None = None
+        self._schedule_task: asyncio.Task | None = None
         self.first_start_marker = cfg.state_dir / "first_start_done"
         self._delivered_path = cfg.state_dir / "delivered.json"
         self._last_delivered: dict[int, str] = self._load_delivered()
@@ -589,9 +596,15 @@ class COOBot(discord.Client):
             logger.exception("failed to persist delivered.json")
 
     async def _send_to_agent(self, text: str, cancel_first: bool = False) -> None:
-        """Serialised paste into Claude's pane; prevents concurrent paste collisions."""
+        """Serialised paste into Claude's pane; prevents concurrent paste collisions.
+
+        After each send, clear the response-level dedup so the next response
+        Claude produces gets dispatched — even if textually identical to the
+        previous one. Per-marker dedup downstream prevents duplicate side-effects.
+        """
         async with self._send_lock:
             await asyncio.to_thread(self.bridge.send_prompt, text, cancel_first)
+            self.bridge._last_response_key = None
 
     async def setup_hook(self) -> None:
         self._session_was_new = self.bridge.ensure_session()
@@ -613,6 +626,7 @@ class COOBot(discord.Client):
             await self._send_amendment()
 
         self._capture_task = asyncio.create_task(self._capture_loop())
+        self._schedule_task = asyncio.create_task(self._schedule_loop())
 
     async def _send_initial_mission(self) -> None:
         prompt = mission_prompt(self.cfg, self.allowlist, self.ceo, self.company)
@@ -771,6 +785,77 @@ class COOBot(discord.Client):
         )
         await self._send_to_agent(notice, cancel_first=False)
 
+    async def _schedule_loop(self) -> None:
+        """Every 60s, fire any scheduled_contacts that are due."""
+        await asyncio.sleep(20)  # let initial mission/intro settle
+        while not self.is_closed():
+            try:
+                await self._fire_due_contacts()
+            except Exception:
+                logger.exception("schedule loop error")
+            await asyncio.sleep(60)
+
+    async def _fire_due_contacts(self) -> None:
+        """Pull pending rows whose fire_at has elapsed; nudge the agent for each."""
+        rows = await asyncio.to_thread(self._claim_due_contacts)
+        for row in rows:
+            await self._send_nudge_to_agent(row)
+
+    def _claim_due_contacts(self) -> list[dict]:
+        """Atomically claim due rows by flipping pending -> fired in one txn."""
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            with conn:
+                rows = conn.execute(
+                    "SELECT sc.id, sc.person_id, sc.reason, sc.fire_at, "
+                    "       p.discord_user_id, p.display_name, p.role "
+                    "FROM scheduled_contacts sc "
+                    "JOIN people p ON p.id = sc.person_id "
+                    "WHERE sc.status = 'pending' "
+                    "  AND sc.fire_at <= datetime('now') "
+                    "  AND p.deleted_at IS NULL "
+                    "  AND p.discord_user_id IS NOT NULL "
+                    "ORDER BY sc.fire_at ASC "
+                    "LIMIT 5"
+                ).fetchall()
+                ids = [r["id"] for r in rows]
+                for rid in ids:
+                    conn.execute(
+                        "UPDATE scheduled_contacts "
+                        "SET status = 'fired', fired_at = datetime('now') "
+                        "WHERE id = ? AND status = 'pending'",
+                        (rid,),
+                    )
+                    conn.execute(
+                        "INSERT INTO audit_log (actor_kind, action, target_kind, "
+                        "  target_id, payload_json) "
+                        "VALUES ('system', 'scheduled_contact_fired', "
+                        "  'scheduled_contact', ?, ?)",
+                        (rid, json.dumps({"reason": next(r["reason"] for r in rows if r["id"] == rid)})),
+                    )
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    async def _send_nudge_to_agent(self, row: dict) -> None:
+        uid = int(row["discord_user_id"])
+        notice = (
+            f"[[BRIDGE_NUDGE user_id={uid}]]\n\n"
+            f"A scheduled contact you set has come due.\n"
+            f"  - Person:  {row['display_name']} (role: {row['role'] or 'unknown'})\n"
+            f"  - Reason:  {row['reason']}\n"
+            f"  - Was due: {row['fire_at']}\n\n"
+            "Decide what to do now: send a DM with `[[COO_TO user_id=...]] ...` "
+            "if it's time to follow up, or reply NOOP if no action is needed. "
+            "You may also chain another `[[COO_NEXT_CONTACT ...]]` if you want "
+            "to push the follow-up further out."
+        )
+        logger.info(
+            "firing scheduled_contact id=%s person_id=%s reason=%s",
+            row["id"], row["person_id"], row["reason"],
+        )
+        await self._send_to_agent(notice, cancel_first=False)
+
     def _record_scheduled_contact(self, uid: int, secs: int, reason: str) -> None:
         tconn = _connect(self.cfg.tenant_db)
         try:
@@ -780,9 +865,20 @@ class COOBot(discord.Client):
             if not person_row:
                 logger.warning("scheduled contact for unknown uid=%s; skipping", uid)
                 return
-            fire_at = (
-                "datetime('now', ?)"
-            )
+            # Freshness dedup: same (person, reason) within 60s is a re-emission
+            # of the same marker, not a real new schedule.
+            recent = tconn.execute(
+                "SELECT id FROM scheduled_contacts "
+                "WHERE person_id = ? AND reason = ? "
+                "AND created_at > datetime('now', '-60 seconds')",
+                (person_row["id"], reason),
+            ).fetchone()
+            if recent:
+                logger.debug(
+                    "dedup: skipping duplicate scheduled_contact uid=%s reason=%r",
+                    uid, reason,
+                )
+                return
             tconn.execute(
                 "INSERT INTO scheduled_contacts (person_id, fire_at, reason, status) "
                 "VALUES (?, datetime('now', ?), ?, 'pending')",
