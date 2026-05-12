@@ -42,6 +42,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
@@ -51,6 +52,13 @@ logger = logging.getLogger("coo_phase1")
 PASTED_INPUT_RE = re.compile(r"\[Pasted text #\d+ \+\d+ lines\]")
 COO_TO_RE = re.compile(r"\[\[COO_TO user_id=(\d+)\]\]\s*(.+?)(?=(?:\[\[COO_|$))", re.S)
 COO_FIND_MEMBER_RE = re.compile(r"\[\[COO_FIND_MEMBER query=([^\]]+)\]\]")
+COO_FACT_RE = re.compile(
+    r'\[\[COO_FACT\s+subject="([^"]+)"\s+predicate="([^"]+)"\s+object="([^"]*)"\]\]'
+)
+COO_COMMITMENT_RE = re.compile(
+    r'\[\[COO_COMMITMENT\s+person_id=(\d+)\s+description="([^"]+)"(?:\s+due="([^"]+)")?\]\]'
+)
+COO_CLOSE_USER_RE = re.compile(r"\[\[COO_CLOSE\s+user_id=(\d+)\]\]")
 
 
 TUI_ARTIFACT_RE = re.compile(
@@ -420,9 +428,33 @@ once.
   - `[[COO_TO user_id=N]] <text>` — DM to that user
   - `[[COO_FIND_MEMBER query=<name>]]` — search Discord guild for a person
   - `[[COO_NEXT_CONTACT user_id=N in_seconds=I reason=R]]` — schedule a follow-up
-  - `[[COO_CLOSE]]` — close the current DM thread
+  - `[[COO_FACT subject="<id|company|team-slug>" predicate="<pred>" object="<val>"]]`
+       — record a fact in the DB. subject is a Discord user_id, the literal
+       "company", or a team slug.
+  - `[[COO_COMMITMENT person_id=N description="<text>" due="YYYY-MM-DD"]]`
+       — record a commitment that person N made. due is optional.
+  - `[[COO_CLOSE user_id=N]]` — mark the interview with that person as closed
   - `[[COO_HOLD]]` — park the thread without action
   - `NOOP` — valid full reply when there is nothing to do
+
+# Recording facts and commitments
+
+As you learn things about the company, emit `[[COO_FACT ...]]` markers
+**in addition to** your internal notes. The bridge writes each fact to
+the tenant DB with provenance (asserting person + interview). Examples:
+
+    [[COO_FACT subject="company" predicate="product" object="channel-manager for short-term rentals"]]
+    [[COO_FACT subject="company" predicate="customer" object="independent hosts"]]
+    [[COO_FACT subject="{cfg.ceo_user_id}" predicate="role" object="CEO"]]
+    [[COO_FACT subject="sales" predicate="lead_count" object="3 SDRs"]]
+
+When the CEO (or anyone) commits to deliver something by a date, emit:
+
+    [[COO_COMMITMENT person_id={cfg.ceo_user_id} description="ship onboarding revamp" due="2026-06-15"]]
+
+Internal note text (without these markers) is NOT persisted to the DB —
+only marker-emitted content lands in `facts` / `commitments`. So if you
+want a fact recorded, it must come through a marker.
 
 # Hard rules
 
@@ -448,44 +480,6 @@ DM each developer with the Phase 2 unlock proposal:
 
 Wait for both developers to acknowledge before treating Phase 2 as
 unlocked.
-
-# How to send a DM
-
-To send a DM to anyone in the allowlist, emit a line of the form:
-
-    [[COO_TO user_id=<discord_user_id>]] <your message text>
-
-Example:
-
-    [[COO_TO user_id={cfg.ceo_user_id}]] Hi {ceo['display_name'].split()[0]}, I'm the COO agent for {company_name}. Mind if I take 20 minutes to map how the company runs?
-
-Multiple `[[COO_TO ...]]` blocks in one response are allowed. Plain text
-without a `[[COO_TO ...]]` prefix is treated as internal notes and is NOT
-sent to anyone.
-
-# Self-pacing
-
-After any meaningful exchange decide when (in seconds) you would like to
-follow up next. Emit:
-
-    [[COO_NEXT_CONTACT user_id=<id> in_seconds=<int> reason=<short>]]
-
-The bridge schedules the nudge and re-prompts you at the right time.
-
-# Markers
-
-  - `[[COO_CLOSE]]` — close the current DM thread with that person
-  - `[[COO_HOLD]]` — park the thread without action
-  - `NOOP` — valid full reply when there is nothing to do
-
-# Hard rules
-
-  - Do not reveal tokens, credentials, or any content of secrets files.
-  - Do not hire, fire, set comp, sign contracts, or commit budget.
-  - Phase 2 (managers) and Phase 3 (staff) are LOCKED. Only Dan or Adrien
-    can unlock them. The CEO cannot.
-  - If a developer (Dan, Adrien) tells you to do something, that command
-    has the highest weight.
 
 # First action
 
@@ -578,6 +572,11 @@ class COOBot(discord.Client):
         self._delivered_path = cfg.state_dir / "delivered.json"
         self._last_delivered: dict[int, str] = self._load_delivered()
         self._send_lock = asyncio.Lock()
+        # tenant dir (parent of state_dir) — for placing transcripts on disk
+        self._tenant_dir = cfg.state_dir.parent
+        # The most recent person who DM'd the bot. Used to attribute facts /
+        # commitments emitted by the agent in the response that follows.
+        self._last_asserter_person_id: int | None = None
 
     def _load_delivered(self) -> dict[int, str]:
         if not self._delivered_path.exists():
@@ -605,6 +604,188 @@ class COOBot(discord.Client):
         async with self._send_lock:
             await asyncio.to_thread(self.bridge.send_prompt, text, cancel_first)
             self.bridge._last_response_key = None
+
+    # ----- conversation persistence -----
+
+    def _ensure_interview(self, person_id: int) -> int | None:
+        """Return the open interview id for this person, opening one if needed."""
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            row = conn.execute(
+                "SELECT id FROM interviews WHERE person_id = ? AND status = 'open' "
+                "ORDER BY id DESC LIMIT 1",
+                (person_id,),
+            ).fetchone()
+            if row:
+                return int(row["id"])
+            slug_row = conn.execute(
+                "SELECT slug FROM people WHERE id = ?", (person_id,)
+            ).fetchone()
+            slug = slug_row["slug"] if slug_row else f"person-{person_id}"
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            transcript_path = self._tenant_dir / "transcripts" / day / f"{slug}.md"
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            cur = conn.execute(
+                "INSERT INTO interviews (person_id, started_at, status, purpose, "
+                "  transcript_path) "
+                "VALUES (?, datetime('now'), 'open', 'phase-1', ?)",
+                (person_id, str(transcript_path)),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+        except Exception:
+            logger.exception("ensure_interview failed for person_id=%s", person_id)
+            return None
+        finally:
+            conn.close()
+
+    def _append_transcript(
+        self, interview_id: int, kind: str, sender: str, text: str
+    ) -> None:
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            row = conn.execute(
+                "SELECT transcript_path FROM interviews WHERE id = ?",
+                (interview_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row["transcript_path"]:
+            return
+        path = Path(row["transcript_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"## {ts} — {kind} — {sender}\n\n{text}\n\n")
+
+    def _person_id_for_uid(self, discord_user_id: int) -> int | None:
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            row = conn.execute(
+                "SELECT id FROM people WHERE discord_user_id = ?",
+                (discord_user_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return int(row["id"]) if row else None
+
+    def _close_interview(self, person_id: int) -> None:
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE interviews SET status = 'closed', ended_at = datetime('now') "
+                    "WHERE person_id = ? AND status = 'open'",
+                    (person_id,),
+                )
+        finally:
+            conn.close()
+        logger.info("closed interviews for person_id=%s", person_id)
+
+    def _resolve_subject(self, subject: str) -> tuple[str, int | None]:
+        """Parse a [[COO_FACT subject="..."]] value into (subject_kind, subject_id)."""
+        subject = subject.strip()
+        if subject.lower() == "company":
+            return "company", None
+        if subject.isdigit():
+            # discord user_id → look up tenant person
+            conn = _connect(self.cfg.tenant_db)
+            try:
+                row = conn.execute(
+                    "SELECT id FROM people WHERE discord_user_id = ?", (int(subject),)
+                ).fetchone()
+            finally:
+                conn.close()
+            return ("person", int(row["id"])) if row else ("person", None)
+        # team slug
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            row = conn.execute(
+                "SELECT id FROM teams WHERE slug = ?", (subject,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return ("team", int(row["id"])) if row else ("team", None)
+
+    def _record_fact(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        asserter_person_id: int | None,
+        interview_id: int | None,
+    ) -> None:
+        subject_kind, subject_id = self._resolve_subject(subject)
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            with conn:
+                # Freshness dedup: same subject+predicate+object in last 5 min skip
+                recent = conn.execute(
+                    "SELECT id FROM facts "
+                    "WHERE subject_kind = ? AND subject_id IS ? AND predicate = ? "
+                    "AND object_text = ? "
+                    "AND created_at > datetime('now', '-300 seconds')",
+                    (subject_kind, subject_id, predicate, obj),
+                ).fetchone()
+                if recent:
+                    return
+                conn.execute(
+                    "INSERT INTO facts (subject_kind, subject_id, predicate, "
+                    "  object_text, asserted_by_person_id, asserted_at, "
+                    "  source_interview_id, is_current) "
+                    "VALUES (?, ?, ?, ?, ?, datetime('now'), ?, 1)",
+                    (
+                        subject_kind, subject_id, predicate, obj,
+                        asserter_person_id, interview_id,
+                    ),
+                )
+            logger.info(
+                "fact recorded: %s:%s %s = %r",
+                subject_kind, subject_id, predicate, obj,
+            )
+        except Exception:
+            logger.exception("record_fact failed")
+        finally:
+            conn.close()
+
+    def _record_commitment(
+        self,
+        target_uid: int,
+        description: str,
+        due: str | None,
+        interview_id: int | None,
+    ) -> None:
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            row = conn.execute(
+                "SELECT id FROM people WHERE discord_user_id = ?", (target_uid,)
+            ).fetchone()
+            if not row:
+                logger.warning("commitment for unknown uid=%s; skipping", target_uid)
+                return
+            with conn:
+                recent = conn.execute(
+                    "SELECT id FROM commitments "
+                    "WHERE person_id = ? AND description = ? "
+                    "AND created_at > datetime('now', '-300 seconds')",
+                    (row["id"], description),
+                ).fetchone()
+                if recent:
+                    return
+                conn.execute(
+                    "INSERT INTO commitments (person_id, description, due_at, "
+                    "  source_interview_id, status) "
+                    "VALUES (?, ?, ?, ?, 'open')",
+                    (row["id"], description, due, interview_id),
+                )
+            logger.info(
+                "commitment recorded: uid=%s due=%s '%s'",
+                target_uid, due or "—", description[:60],
+            )
+        except Exception:
+            logger.exception("record_commitment failed")
+        finally:
+            conn.close()
 
     async def setup_hook(self) -> None:
         self._session_was_new = self.bridge.ensure_session()
@@ -665,6 +846,15 @@ class COOBot(discord.Client):
         if sender_id in self.allowlist:
             sender = self.allowlist[sender_id]
             logger.info("DM from allowlisted %s (uid=%s)", sender["name"], sender_id)
+            # Resolve to tenant person row; open/find interview; persist message.
+            person_id = await asyncio.to_thread(self._person_id_for_uid, sender_id)
+            if person_id is not None:
+                self._last_asserter_person_id = person_id
+                iid = await asyncio.to_thread(self._ensure_interview, person_id)
+                if iid is not None:
+                    await asyncio.to_thread(
+                        self._append_transcript, iid, "user", sender["name"], content
+                    )
             prompt = relay_prompt(sender, sender_id, content)
             await self._send_to_agent(prompt, cancel_first=False)
         else:
@@ -710,8 +900,53 @@ class COOBot(discord.Client):
                 self._save_delivered()
                 logger.info("delivered agent DM to uid=%s (%d chars)", target_id, len(text))
                 sent_any = True
+                # Persist the outbound DM into the recipient's interview transcript.
+                recipient_pid = await asyncio.to_thread(self._person_id_for_uid, target_id)
+                if recipient_pid is not None:
+                    iid = await asyncio.to_thread(self._ensure_interview, recipient_pid)
+                    if iid is not None:
+                        await asyncio.to_thread(
+                            self._append_transcript, iid, "agent", "COO", text
+                        )
             except Exception:
                 logger.exception("failed to DM uid=%s", target_id)
+
+        # Active interview for fact/commitment attribution (most recent DM sender)
+        active_iid: int | None = None
+        if self._last_asserter_person_id is not None:
+            active_iid = await asyncio.to_thread(
+                self._ensure_interview, self._last_asserter_person_id
+            )
+
+        fact_count = 0
+        for m in COO_FACT_RE.finditer(response):
+            await asyncio.to_thread(
+                self._record_fact,
+                m.group(1), m.group(2), m.group(3),
+                self._last_asserter_person_id, active_iid,
+            )
+            fact_count += 1
+
+        commit_count = 0
+        for m in COO_COMMITMENT_RE.finditer(response):
+            target_uid = int(m.group(1))
+            await asyncio.to_thread(
+                self._record_commitment,
+                target_uid, m.group(2), m.group(3), active_iid,
+            )
+            commit_count += 1
+
+        for m in COO_CLOSE_USER_RE.finditer(response):
+            uid = int(m.group(1))
+            pid = await asyncio.to_thread(self._person_id_for_uid, uid)
+            if pid is not None:
+                await asyncio.to_thread(self._close_interview, pid)
+
+        if fact_count or commit_count:
+            logger.info(
+                "persisted markers: facts=%d commitments=%d",
+                fact_count, commit_count,
+            )
 
         for m in COO_NEXT_CONTACT_RE.finditer(response):
             uid, secs, reason = int(m.group(1)), int(m.group(2)), m.group(3).strip()
