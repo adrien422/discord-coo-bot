@@ -547,12 +547,11 @@ want a fact recorded, it must come through a marker.
   - Do not hire, fire, set comp, sign contracts, or commit budget.
   - Phase 2 (managers) and Phase 3 (staff) are LOCKED. Only the developers
     (user_ids: {dev_ids_csv}) can unlock them. The CEO cannot.
-  - **Do NOT use the auto-memory / Claude Code memory tool**. Memory is
-    not yet isolated per tenant on this VM, so reading or writing it
-    can mix data across companies. Track everything in this pane and
-    in the company-map files only. If you find yourself reaching for
-    "recall a memory" or "save a memory", stop — the conversation pane
-    IS your memory for this session.
+  - The Claude Code memory tool is now per-tenant isolated (CLAUDE_CONFIG_DIR
+    points at this tenant's `.claude/`). It's safe to use, but the DB
+    (facts / commitments / decisions tables, via the markers above) is the
+    authoritative source — write structured data there, use memory only
+    as a working scratchpad.
 
 # Phase 1 exit gate
 

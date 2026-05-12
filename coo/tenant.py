@@ -117,6 +117,33 @@ def new_cmd():
     for sub in ("db", "transcripts", "reports", "state", "company-map/people", "company-map/factsheets"):
         (tenant_dir / sub).mkdir(parents=True, exist_ok=True)
     (tenant_dir / "messaging").mkdir(mode=0o700, exist_ok=True)
+
+    # Per-tenant Claude config (CLAUDE_CONFIG_DIR target). We want:
+    #   - shared auth so we don't OAuth per tenant: copy .claude.json from $HOME
+    #     and symlink .credentials.json from ~/.claude/.
+    #   - shared plugins / skills / statsig: symlink.
+    #   - per-tenant projects/ (memory): empty dir, lets Claude create
+    #     project-scoped memory under this tenant's workdir without bleeding
+    #     across tenants.
+    tenant_claude = tenant_dir / ".claude"
+    tenant_claude.mkdir(mode=0o700, exist_ok=True)
+    home = Path.home()
+    if (home / ".claude.json").exists():
+        import shutil
+        shutil.copy2(home / ".claude.json", tenant_claude / ".claude.json")
+        (tenant_claude / ".claude.json").chmod(0o600)
+    op_claude = home / ".claude"
+    for name in (".credentials.json", "settings.json", "plugins", "skills", "statsig"):
+        src = op_claude / name
+        link = tenant_claude / name
+        if src.exists() and not link.exists():
+            try:
+                link.symlink_to(src)
+            except OSError:
+                pass
+    # Empty projects/ — per-tenant memory, no cross-tenant contamination.
+    (tenant_claude / "projects").mkdir(mode=0o700, exist_ok=True)
+
     tenant_dir.chmod(0o750)
 
     tenant_db = tenant_dir / "db" / "coo.db"
@@ -179,6 +206,7 @@ def new_cmd():
         f"DISCORD_COO_TMUX_SESSION=coo_{slug}\n"
         f"DISCORD_COO_AGENT_KIND=claude\n"
         f"DISCORD_COO_RUN_AI={run_ai}\n"
+        f"CLAUDE_CONFIG_DIR={tenant_dir}/.claude\n"
     )
     secrets_file.chmod(0o600)
 
