@@ -58,7 +58,25 @@ COO_FACT_RE = re.compile(
 COO_COMMITMENT_RE = re.compile(
     r'\[\[COO_COMMITMENT\s+person_id=(\d+)\s+description="([^"]+)"(?:\s+due="([^"]+)")?\]\]'
 )
+COO_DECISION_RE = re.compile(r"\[\[COO_DECISION\s+(.+?)\]\]", re.S)
+_KV_RE = re.compile(r'(\w+)="([^"]*)"')
+
+
+def _parse_decision_fields(inner: str) -> tuple[str, str, str | None, str | None]:
+    """Tolerate Claude's variants on field names."""
+    fields = dict(_KV_RE.findall(inner))
+    title = fields.get("title") or fields.get("subject") or ""
+    body = (
+        fields.get("text")
+        or fields.get("description")
+        or fields.get("decision_text")
+        or ""
+    )
+    rationale = fields.get("rationale") or None
+    scope = fields.get("scope") or None
+    return title, body, rationale, scope
 COO_CLOSE_USER_RE = re.compile(r"\[\[COO_CLOSE\s+user_id=(\d+)\]\]")
+PHASE_APPROVAL_RE = re.compile(r"\bapprove\s+phase\s+([2-9])\b", re.I)
 
 
 TUI_ARTIFACT_RE = re.compile(
@@ -347,6 +365,16 @@ class AgentBridge:
         if len(body) >= 3:
             text = "".join(body[:-2])
 
+        # Remove Claude Code's own TUI prompts that show as `●` blocks —
+        # otherwise the rating prompt becomes the "latest" and masks the
+        # real agent response.
+        text = re.sub(
+            r"●\s+How is Claude doing this session\?.*?(?=^●|\Z)",
+            "",
+            text,
+            flags=re.S | re.M,
+        )
+
         marker = list(re.finditer(r"^●\s+(.+)$", text, flags=re.M))
         if not marker:
             return None
@@ -488,6 +516,8 @@ once.
        "company", or a team slug.
   - `[[COO_COMMITMENT person_id=N description="<text>" due="YYYY-MM-DD"]]`
        — record a commitment that person N made. due is optional.
+  - `[[COO_DECISION title="<title>" text="<what was decided>" rationale="<why>" scope="<id|company|team-slug>"]]`
+       — record a significant decision. rationale and scope are optional.
   - `[[COO_CLOSE user_id=N]]` — mark the interview with that person as closed
   - `[[COO_HOLD]]` — park the thread without action
   - `NOOP` — valid full reply when there is nothing to do
@@ -535,6 +565,12 @@ DM each developer with the Phase 2 unlock proposal:
 
 Wait for both developers to acknowledge before treating Phase 2 as
 unlocked.
+
+A developer DM containing the phrase **"approve phase N"** (any case)
+is auto-detected by the bridge — it bumps tenants.phase to N in the
+platform DB and sends you a `[[BRIDGE_PHASE_UNLOCKED phase=N by_uid=...]]`
+notice. After you receive that for phase 2 from BOTH developers, you may
+DM managers freely.
 
 # First action
 
@@ -804,6 +840,74 @@ class COOBot(discord.Client):
         finally:
             conn.close()
 
+    def _record_decision(
+        self,
+        title: str,
+        text: str,
+        rationale: str | None,
+        scope: str | None,
+        asserter_person_id: int | None,
+        interview_id: int | None,
+    ) -> None:
+        scope_kind: str | None = None
+        scope_id: int | None = None
+        if scope:
+            kind, sid = self._resolve_subject(scope)
+            scope_kind, scope_id = kind, sid
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            with conn:
+                recent = conn.execute(
+                    "SELECT id FROM decisions WHERE title = ? AND decision_text = ? "
+                    "AND created_at > datetime('now', '-300 seconds')",
+                    (title, text),
+                ).fetchone()
+                if recent:
+                    return
+                conn.execute(
+                    "INSERT INTO decisions (title, decision_text, rationale, "
+                    "  decided_by_person_id, decided_at, scope_kind, scope_id, "
+                    "  source_interview_id, is_current) "
+                    "VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, 1)",
+                    (title, text, rationale, asserter_person_id,
+                     scope_kind, scope_id, interview_id),
+                )
+            logger.info("decision recorded: %r (scope=%s)", title, scope_kind)
+        except Exception:
+            logger.exception("record_decision failed")
+        finally:
+            conn.close()
+
+    def _unlock_phase(self, new_phase: int, approver_uid: int) -> bool:
+        """Bump the tenant's phase in platform.tenants if the new phase is higher."""
+        pconn = _connect(self.cfg.platform_db)
+        try:
+            row = pconn.execute(
+                "SELECT id, phase FROM tenants WHERE slug = ?",
+                (self.cfg.tenant_slug,),
+            ).fetchone()
+            if not row:
+                return False
+            if row["phase"] >= new_phase:
+                return False
+            with pconn:
+                pconn.execute(
+                    "UPDATE tenants SET phase = ? WHERE id = ?",
+                    (new_phase, row["id"]),
+                )
+                pconn.execute(
+                    "INSERT INTO platform_audit (action, tenant_id, payload_json) "
+                    "VALUES ('phase_unlocked', ?, ?)",
+                    (row["id"], json.dumps({
+                        "from_phase": row["phase"],
+                        "to_phase": new_phase,
+                        "approver_uid": approver_uid,
+                    })),
+                )
+            return True
+        finally:
+            pconn.close()
+
     def _record_commitment(
         self,
         target_uid: int,
@@ -907,6 +1011,33 @@ class COOBot(discord.Client):
         if sender_id in self.allowlist:
             sender = self.allowlist[sender_id]
             logger.info("DM from allowlisted %s (uid=%s)", sender["name"], sender_id)
+
+            # Phase unlock: a developer DM containing "approve phase N" advances
+            # tenants.phase. Both devs aren't required at the bot level — the
+            # mission prompt tells Claude to wait for both before treating it
+            # as unlocked, but the platform DB tracks the latest phase reached.
+            if sender.get("tier") == "developer":
+                m = PHASE_APPROVAL_RE.search(content)
+                if m:
+                    new_phase = int(m.group(1))
+                    unlocked = await asyncio.to_thread(
+                        self._unlock_phase, new_phase, sender_id,
+                    )
+                    if unlocked:
+                        logger.info(
+                            "phase advanced to %d by uid=%s",
+                            new_phase, sender_id,
+                        )
+                        await self._send_to_agent(
+                            f"[[BRIDGE_PHASE_UNLOCKED phase={new_phase} "
+                            f"by_uid={sender_id} by_name=\"{sender['name']}\"]]\n\n"
+                            f"Developer {sender['name']} has approved unlocking "
+                            f"to Phase {new_phase}. You may now act on "
+                            f"that-phase capabilities (e.g. DM managers for "
+                            f"Phase 2). Continue the conversation; respond NOOP "
+                            f"if no immediate action.",
+                            cancel_first=False,
+                        )
             # Resolve to tenant person row; open/find interview; persist message.
             person_id = await asyncio.to_thread(self._person_id_for_uid, sender_id)
             if person_id is not None:
@@ -999,16 +1130,28 @@ class COOBot(discord.Client):
             )
             commit_count += 1
 
+        decision_count = 0
+        for m in COO_DECISION_RE.finditer(response):
+            title, body, rationale, scope = _parse_decision_fields(m.group(1))
+            if not title or not body:
+                continue
+            await asyncio.to_thread(
+                self._record_decision,
+                title, body, rationale, scope,
+                self._last_asserter_person_id, active_iid,
+            )
+            decision_count += 1
+
         for m in COO_CLOSE_USER_RE.finditer(response):
             uid = int(m.group(1))
             pid = await asyncio.to_thread(self._person_id_for_uid, uid)
             if pid is not None:
                 await asyncio.to_thread(self._close_interview, pid)
 
-        if fact_count or commit_count:
+        if fact_count or commit_count or decision_count:
             logger.info(
-                "persisted markers: facts=%d commitments=%d",
-                fact_count, commit_count,
+                "persisted markers: facts=%d commitments=%d decisions=%d",
+                fact_count, commit_count, decision_count,
             )
 
         for m in COO_NEXT_CONTACT_RE.finditer(response):
@@ -1168,12 +1311,79 @@ class COOBot(discord.Client):
         finally:
             conn.close()
 
+    def _cadence_context(self, kind: str) -> str:
+        """Pull relevant DB context for the agent based on cadence kind."""
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            if kind in ("weekly-pulse", "daily-brief"):
+                rows = conn.execute(
+                    "SELECT c.description, c.due_at, c.status, p.display_name, "
+                    "       p.discord_user_id "
+                    "FROM commitments c JOIN people p ON p.id = c.person_id "
+                    "WHERE c.status = 'open' "
+                    "ORDER BY c.due_at IS NULL, c.due_at ASC LIMIT 20"
+                ).fetchall()
+                if not rows:
+                    return "Open commitments: (none recorded)"
+                lines = [
+                    f"  - {r['display_name']} (uid={r['discord_user_id']}): "
+                    f"\"{r['description']}\" due {r['due_at'] or '—'}"
+                    for r in rows
+                ]
+                return "Open commitments:\n" + "\n".join(lines)
+            if kind == "monthly-review":
+                rows = conn.execute(
+                    "SELECT m.slug, m.name, m.unit, m.target_value, m.target_direction, "
+                    "       (SELECT value FROM metric_values WHERE metric_id = m.id "
+                    "        ORDER BY observed_at DESC LIMIT 1) AS latest, "
+                    "       (SELECT observed_at FROM metric_values WHERE metric_id = m.id "
+                    "        ORDER BY observed_at DESC LIMIT 1) AS latest_at, "
+                    "       (SELECT COUNT(*) FROM metric_values WHERE metric_id = m.id "
+                    "        AND is_anomaly = 1) AS anomalies "
+                    "FROM metrics m WHERE m.is_active = 1 ORDER BY m.id"
+                ).fetchall()
+                if not rows:
+                    return "Metrics: (none defined yet — agent has no quantitative data)"
+                lines = []
+                for r in rows:
+                    target = (
+                        f" target {r['target_direction']} {r['target_value']}"
+                        if r["target_value"] is not None else ""
+                    )
+                    anom = f" [{r['anomalies']} anomalies]" if r["anomalies"] else ""
+                    lines.append(
+                        f"  - {r['slug']} ({r['name']}): latest "
+                        f"{r['latest']}{r['unit'] or ''} at {r['latest_at']}"
+                        f"{target}{anom}"
+                    )
+                return "Metrics snapshot:\n" + "\n".join(lines)
+            if kind == "risk-review":
+                rows = conn.execute(
+                    "SELECT slug, title, likelihood, impact, status, "
+                    "       last_reviewed_at, review_cadence "
+                    "FROM risks WHERE status IN ('open', 'mitigated') "
+                    "ORDER BY last_reviewed_at IS NULL DESC, last_reviewed_at ASC"
+                ).fetchall()
+                if not rows:
+                    return "Risk register: (empty)"
+                lines = [
+                    f"  - {r['slug']}: {r['title']} "
+                    f"[likelihood={r['likelihood']}, impact={r['impact']}, "
+                    f"status={r['status']}, last_reviewed={r['last_reviewed_at'] or 'never'}]"
+                    for r in rows
+                ]
+                return "Open risks:\n" + "\n".join(lines)
+        finally:
+            conn.close()
+        return ""
+
     async def _send_cadence_to_agent(self, row: dict) -> None:
         kind = row["kind"]
         instructions = CADENCE_INSTRUCTIONS.get(
             kind,
             "Take whatever action this cadence is for, based on the kind name.",
         )
+        context = await asyncio.to_thread(self._cadence_context, kind)
         notice = (
             f"[[BRIDGE_CADENCE run_id={row['run_id']} kind={kind} "
             f"scope={row['scope_kind']}]]\n\n"
@@ -1182,9 +1392,11 @@ class COOBot(discord.Client):
             f"  - Kind:    {kind}\n"
             f"  - Scope:   {row['scope_kind']}\n\n"
             f"{instructions}\n\n"
-            "Take whatever action is appropriate now (DMs, [[COO_FACT]] / "
-            "[[COO_COMMITMENT]] markers to record results, [[COO_NEXT_CONTACT]] "
-            "to chase later). Reply NOOP if there's nothing to do this cycle."
+            + (f"DB snapshot:\n{context}\n\n" if context else "")
+            + "Take whatever action is appropriate now (DMs, [[COO_FACT]] / "
+            "[[COO_COMMITMENT]] / [[COO_DECISION]] markers to record results, "
+            "[[COO_NEXT_CONTACT]] to chase later). Reply NOOP if there's "
+            "nothing to do this cycle."
         )
         logger.info(
             "firing cadence slug=%s kind=%s run_id=%s",

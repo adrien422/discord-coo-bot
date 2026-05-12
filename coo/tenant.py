@@ -547,6 +547,187 @@ def seed_cadences_cmd(slug: str):
     click.echo(f"Cadences seeded: inserted={inserted}, skipped={skipped}.")
 
 
+@tenant_cmd.command(name="cadences")
+@click.argument("slug")
+def cadences_cmd(slug: str):
+    """Show this tenant's cadences and when each fires next."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    conn = connect(tenant_db)
+    rows = conn.execute(
+        "SELECT id, slug, kind, scope_kind, cron_expr, "
+        "       next_fire_at, last_fired_at, is_active "
+        "FROM cadences ORDER BY next_fire_at IS NULL DESC, next_fire_at ASC"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        click.echo("No cadences. Run `coo tenant seed-cadences <slug>`.")
+        return
+    click.echo(
+        f"{'id':>3}  {'slug':<22}  {'kind':<20}  {'scope':<8}  "
+        f"{'next fire (UTC)':<20}  {'last fire (UTC)':<20}  active"
+    )
+    for r in rows:
+        click.echo(
+            f"{r['id']:>3}  {r['slug']:<22}  {r['kind']:<20}  "
+            f"{r['scope_kind']:<8}  {(r['next_fire_at'] or '-'):<20}  "
+            f"{(r['last_fired_at'] or '-'):<20}  {'yes' if r['is_active'] else 'no'}"
+        )
+
+
+@tenant_cmd.command(name="fire-cadence")
+@click.argument("slug")
+@click.argument("cadence_slug")
+def fire_cadence_cmd(slug: str, cadence_slug: str):
+    """Force a cadence to fire on the bot's next poll (within 60s)."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    conn = connect(tenant_db)
+    try:
+        cur = conn.execute(
+            "UPDATE cadences SET next_fire_at = datetime('now', '-1 seconds') "
+            "WHERE slug = ?",
+            (cadence_slug,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    if cur.rowcount == 0:
+        click.echo(f"No cadence with slug {cadence_slug!r}.", err=True)
+        sys.exit(1)
+    click.echo(
+        f"Cadence {cadence_slug!r} set to fire immediately. The bot's "
+        "_cadence_loop polls every 60s, so it'll fire within a minute."
+    )
+
+
+@tenant_cmd.command(name="metric-add")
+@click.argument("slug")
+def metric_add_cmd(slug: str):
+    """Define a new KPI / metric to track for the tenant."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+
+    metric_slug = click.prompt("Metric slug (e.g. 'mrr', 'pipeline-coverage')").strip()
+    name = click.prompt("Display name").strip()
+    description = click.prompt(
+        "Short description", default="", show_default=False
+    ).strip()
+    scope_kind = click.prompt(
+        "Scope", type=click.Choice(["company", "team", "person", "workflow"]),
+        default="company",
+    )
+    unit = click.prompt("Unit (e.g. '$', '%', 'count')", default="", show_default=False).strip()
+    target_raw = click.prompt(
+        "Target value (blank for none)", default="", show_default=False
+    ).strip()
+    target_value = float(target_raw) if target_raw else None
+    target_direction = None
+    if target_value is not None:
+        target_direction = click.prompt(
+            "Target direction", type=click.Choice(["higher", "lower", "equal"]),
+            default="higher",
+        )
+
+    conn = connect(tenant_db)
+    try:
+        existing = conn.execute(
+            "SELECT id FROM metrics WHERE slug = ?", (metric_slug,)
+        ).fetchone()
+        if existing:
+            click.echo(f"Metric slug {metric_slug!r} already exists.", err=True)
+            sys.exit(1)
+        with transaction(conn):
+            conn.execute(
+                "INSERT INTO metrics (slug, name, description, scope_kind, "
+                "  unit, target_value, target_direction) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (metric_slug, name, description or None, scope_kind,
+                 unit or None, target_value, target_direction),
+            )
+    finally:
+        conn.close()
+    click.echo(f"Added metric {metric_slug!r}.")
+
+
+@tenant_cmd.command(name="metric-record")
+@click.argument("slug")
+@click.argument("metric_slug")
+@click.argument("value", type=float)
+@click.option("--note", default="", help="Optional note attached to this data point.")
+def metric_record_cmd(slug: str, metric_slug: str, value: float, note: str):
+    """Record an observed value for a metric (one data point in the time series)."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    conn = connect(tenant_db)
+    try:
+        m = conn.execute(
+            "SELECT id, target_value, target_direction FROM metrics WHERE slug = ?",
+            (metric_slug,),
+        ).fetchone()
+        if not m:
+            click.echo(f"No metric with slug {metric_slug!r}.", err=True)
+            sys.exit(1)
+        is_anomaly = 0
+        if m["target_value"] is not None and m["target_direction"]:
+            if m["target_direction"] == "higher" and value < m["target_value"] * 0.7:
+                is_anomaly = 1
+            elif m["target_direction"] == "lower" and value > m["target_value"] * 1.3:
+                is_anomaly = 1
+        with transaction(conn):
+            conn.execute(
+                "INSERT INTO metric_values (metric_id, observed_at, value, note, is_anomaly) "
+                "VALUES (?, datetime('now'), ?, ?, ?)",
+                (m["id"], value, note or None, is_anomaly),
+            )
+    finally:
+        conn.close()
+    click.echo(
+        f"Recorded {metric_slug}={value}"
+        + (" (ANOMALY)" if is_anomaly else "")
+        + (f' — "{note}"' if note else "")
+    )
+
+
+@tenant_cmd.command(name="metrics")
+@click.argument("slug")
+def metrics_cmd(slug: str):
+    """Show all metrics + their most recent observed value."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    conn = connect(tenant_db)
+    rows = conn.execute(
+        "SELECT m.slug, m.name, m.unit, m.target_value, m.target_direction, "
+        "       (SELECT value FROM metric_values WHERE metric_id = m.id "
+        "        ORDER BY observed_at DESC LIMIT 1) AS latest, "
+        "       (SELECT observed_at FROM metric_values WHERE metric_id = m.id "
+        "        ORDER BY observed_at DESC LIMIT 1) AS latest_at, "
+        "       (SELECT COUNT(*) FROM metric_values WHERE metric_id = m.id "
+        "        AND is_anomaly = 1) AS anomaly_count "
+        "FROM metrics m WHERE m.is_active = 1 ORDER BY m.id"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        click.echo("No metrics defined yet. Run `coo tenant metric-add <slug>`.")
+        return
+    for r in rows:
+        target = (
+            f" (target {r['target_direction']} {r['target_value']})"
+            if r["target_value"] is not None else ""
+        )
+        anomalies = f" [{r['anomaly_count']} anomalies]" if r["anomaly_count"] else ""
+        latest = (
+            f"{r['latest']}{r['unit'] or ''} @ {r['latest_at']}"
+            if r["latest"] is not None else "no data yet"
+        )
+        click.echo(f"  {r['slug']:<22} {r['name']:<30} → {latest}{target}{anomalies}")
+
+
 @tenant_cmd.command(name="stop")
 @click.argument("slug")
 def stop_cmd(slug: str):
