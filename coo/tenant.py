@@ -14,6 +14,79 @@ from .paths import platform_db_path, repo_root, tenant_schema_dir, tenants_dir
 SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 
 
+# --- systemd user-service support ---------------------------------------
+
+def _systemd_user_dir() -> Path:
+    return Path.home() / ".config" / "systemd" / "user"
+
+
+def _systemd_unit_name(slug: str) -> str:
+    return f"coo-tenant@{slug}.service"
+
+
+def _systemd_available() -> bool:
+    """systemd-user available iff `systemctl --user is-system-running` answers."""
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-system-running"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # 'running', 'degraded', 'starting' are all acceptable — system is up.
+        out = (r.stdout + r.stderr).strip().lower()
+        return r.returncode in (0, 1) and "offline" not in out
+    except Exception:
+        return False
+
+
+def _systemd_unit_template(repo_root_path: Path) -> str:
+    """The template unit file. Instance %i is the tenant slug."""
+    return f"""\
+[Unit]
+Description=COO agent listener — tenant %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory={repo_root_path}
+EnvironmentFile=-%h/.local/share/coo/tenants/%i/messaging/secrets.env
+EnvironmentFile=-/var/coo/tenants/%i/messaging/secrets.env
+ExecStart=/usr/bin/python3 {repo_root_path}/messaging/discord/plugin/coo_phase1.py
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StandardOutput=append:%h/.local/share/coo/tenants/%i/state/bot.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _ensure_systemd_unit() -> Path:
+    """Install the template unit once. Idempotent."""
+    unit_dir = _systemd_user_dir()
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    unit_path = unit_dir / "coo-tenant@.service"
+    expected = _systemd_unit_template(repo_root())
+    if not unit_path.exists() or unit_path.read_text() != expected:
+        unit_path.write_text(expected)
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            check=False, capture_output=True,
+        )
+    return unit_path
+
+
+def _systemctl_user(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["systemctl", "--user", *args],
+        capture_output=True, text=True, timeout=20,
+    )
+
+
 def _get_tenant(slug: str) -> dict:
     conn = connect(platform_db_path())
     row = conn.execute(
@@ -59,19 +132,31 @@ def list_cmd():
     click.echo(
         f"{'id':>3}  {'slug':<15}  {'company':<25}  {'messaging':<10}  {'phase':<5}  {'status':<10}  pid"
     )
+    sd_available = _systemd_available()
     for r in rows:
-        pid_file = Path(r["tenant_dir"]) / "state" / "bot.pid"
-        pid = "-"
-        if pid_file.exists():
-            try:
-                p = int(pid_file.read_text().strip())
-                os.kill(p, 0)
-                pid = str(p)
-            except (OSError, ValueError):
-                pid = "stale"
+        runtime = "-"
+        if sd_available:
+            res = _systemctl_user("is-active", _systemd_unit_name(r["slug"]))
+            state = res.stdout.strip()
+            if state == "active":
+                show_pid = _systemctl_user("show", _systemd_unit_name(r["slug"]),
+                                           "--property=MainPID", "--value")
+                runtime = f"systemd:{show_pid.stdout.strip()}"
+            elif state == "failed":
+                runtime = "systemd:FAILED"
+        if runtime == "-":
+            pid_file = Path(r["tenant_dir"]) / "state" / "bot.pid"
+            if pid_file.exists():
+                try:
+                    p = int(pid_file.read_text().strip())
+                    os.kill(p, 0)
+                    runtime = str(p)
+                except (OSError, ValueError):
+                    runtime = "stale"
         click.echo(
             f"{r['id']:>3}  {r['slug']:<15}  {r['company_name']:<25}  "
-            f"{r['messaging_platform']:<10}  {r['phase']:<5}  {r['status']:<10}  {pid}"
+            f"{r['messaging_platform']:<10}  {r['phase']:<5}  "
+            f"{r['status']:<10}  {runtime}"
         )
 
 
@@ -242,8 +327,12 @@ def new_cmd():
 
 @tenant_cmd.command(name="start")
 @click.argument("slug")
-def start_cmd(slug: str):
-    """Launch the tenant's Discord bot as a child process."""
+@click.option(
+    "--no-systemd", is_flag=True,
+    help="Force subprocess mode even if systemd-user is available.",
+)
+def start_cmd(slug: str, no_systemd: bool):
+    """Launch the tenant's Discord bot. Prefers systemd-user; falls back to subprocess."""
     tenant = _get_tenant(slug)
     tdir = Path(tenant["tenant_dir"])
     secrets_file = tdir / "messaging" / "secrets.env"
@@ -258,6 +347,38 @@ def start_cmd(slug: str):
         click.echo(f"Secrets file missing: {secrets_file}", err=True)
         sys.exit(1)
 
+    # --- systemd path ---
+    if not no_systemd and _systemd_available():
+        unit_path = _ensure_systemd_unit()
+        unit_name = _systemd_unit_name(slug)
+        r = _systemctl_user("start", unit_name)
+        if r.returncode == 0:
+            pconn = connect(platform_db_path())
+            with transaction(pconn):
+                pconn.execute(
+                    "UPDATE tenants SET status = 'running' WHERE slug = ?", (slug,)
+                )
+            pconn.close()
+            click.echo(f"Started {unit_name} via systemd-user.")
+            click.echo(f"  Logs: journalctl --user -u {unit_name} -f")
+            click.echo(f"        {log_file}")
+            click.echo(f"  Unit: {unit_path}")
+            if subprocess.run(
+                ["loginctl", "show-user", os.environ.get("USER", "")],
+                capture_output=True, text=True,
+            ).stdout.find("Linger=no") != -1:
+                click.echo("  NOTE: linger is OFF. The bot stops when you log out.")
+                click.echo("        Run `sudo loginctl enable-linger $USER` to keep "
+                           "it running across logout / reboot.")
+            return
+        click.echo(
+            f"  systemd start failed (rc={r.returncode}): "
+            f"{(r.stderr or r.stdout).strip()[:200]}\n"
+            "  Falling back to subprocess.",
+            err=True,
+        )
+
+    # --- subprocess fallback ---
     if pid_file.exists():
         try:
             pid = int(pid_file.read_text().strip())
@@ -288,7 +409,7 @@ def start_cmd(slug: str):
         pconn.execute("UPDATE tenants SET status = 'running' WHERE slug = ?", (slug,))
     pconn.close()
 
-    click.echo(f"Started {slug} (pid {proc.pid}). Log: {log_file}")
+    click.echo(f"Started {slug} via subprocess (pid {proc.pid}). Log: {log_file}")
 
 
 def _check(label: str, ok: bool, detail: str = "") -> bool:
@@ -1317,8 +1438,25 @@ def inbox_cmd(slug: str, state: str | None, limit: int):
 @tenant_cmd.command(name="stop")
 @click.argument("slug")
 def stop_cmd(slug: str):
-    """Stop the tenant's Discord bot."""
+    """Stop the tenant's Discord bot. Tries systemd first, then SIGTERM."""
     tenant = _get_tenant(slug)
+    unit_name = _systemd_unit_name(slug)
+
+    if _systemd_available():
+        r = _systemctl_user("is-active", unit_name)
+        if r.returncode == 0 and r.stdout.strip() == "active":
+            r2 = _systemctl_user("stop", unit_name)
+            if r2.returncode == 0:
+                pconn = connect(platform_db_path())
+                with transaction(pconn):
+                    pconn.execute(
+                        "UPDATE tenants SET status = 'paused' WHERE slug = ?",
+                        (slug,),
+                    )
+                pconn.close()
+                click.echo(f"Stopped {unit_name} via systemd-user.")
+                return
+
     pid_file = Path(tenant["tenant_dir"]) / "state" / "bot.pid"
     if not pid_file.exists():
         click.echo("Not running.")
