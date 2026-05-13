@@ -76,6 +76,10 @@ def _parse_decision_fields(inner: str) -> tuple[str, str, str | None, str | None
     scope = fields.get("scope") or None
     return title, body, rationale, scope
 COO_CLOSE_USER_RE = re.compile(r"\[\[COO_CLOSE\s+user_id=(\d+)\]\]")
+COO_INBOX_HANDLE_RE = re.compile(
+    r'\[\[COO_INBOX_HANDLE\s+id=(\d+)\s+state=(attended|held|no-action|queued)'
+    r'(?:\s+note="([^"]*)")?\]\]'
+)
 PHASE_APPROVAL_RE = re.compile(r"\bapprove\s+phase\s+([2-9])\b", re.I)
 
 
@@ -519,6 +523,9 @@ once.
   - `[[COO_DECISION title="<title>" text="<what was decided>" rationale="<why>" scope="<id|company|team-slug>"]]`
        — record a significant decision. rationale and scope are optional.
   - `[[COO_CLOSE user_id=N]]` — mark the interview with that person as closed
+  - `[[COO_INBOX_HANDLE id=N state=attended|held|no-action|queued note="<short>"]]`
+       — triage an inbox item (DM from a non-allowlisted user). The daily
+       brief surfaces pending inbox items; you decide what to do with each.
   - `[[COO_HOLD]]` — park the thread without action
   - `NOOP` — valid full reply when there is nothing to do
 
@@ -879,6 +886,29 @@ class COOBot(discord.Client):
         finally:
             conn.close()
 
+    def _handle_inbox_item(self, item_id: int, new_state: str, note: str | None) -> None:
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            with conn:
+                cur = conn.execute(
+                    "UPDATE inbox_items "
+                    "SET workflow_state = ?, "
+                    "    attended_at = CASE WHEN ? IN ('attended', 'no-action') "
+                    "                       THEN datetime('now') ELSE attended_at END "
+                    "WHERE id = ?",
+                    (new_state, new_state, item_id),
+                )
+                if cur.rowcount and note:
+                    conn.execute(
+                        "INSERT INTO audit_log (actor_kind, action, target_kind, "
+                        "  target_id, payload_json) "
+                        "VALUES ('agent', 'inbox_handled', 'inbox_item', ?, ?)",
+                        (item_id, json.dumps({"state": new_state, "note": note})),
+                    )
+        finally:
+            conn.close()
+        logger.info("inbox item #%s → %s (%s)", item_id, new_state, note or "no note")
+
     def _unlock_phase(self, new_phase: int, approver_uid: int) -> bool:
         """Bump the tenant's phase in platform.tenants if the new phase is higher."""
         pconn = _connect(self.cfg.platform_db)
@@ -1158,6 +1188,12 @@ class COOBot(discord.Client):
             if pid is not None:
                 await asyncio.to_thread(self._close_interview, pid)
 
+        for m in COO_INBOX_HANDLE_RE.finditer(response):
+            item_id = int(m.group(1))
+            new_state = m.group(2)
+            note = m.group(3)
+            await asyncio.to_thread(self._handle_inbox_item, item_id, new_state, note)
+
         if fact_count or commit_count or decision_count:
             logger.info(
                 "persisted markers: facts=%d commitments=%d decisions=%d",
@@ -1333,14 +1369,44 @@ class COOBot(discord.Client):
                     "WHERE c.status = 'open' "
                     "ORDER BY c.due_at IS NULL, c.due_at ASC LIMIT 20"
                 ).fetchall()
-                if not rows:
-                    return "Open commitments: (none recorded)"
-                lines = [
-                    f"  - {r['display_name']} (uid={r['discord_user_id']}): "
-                    f"\"{r['description']}\" due {r['due_at'] or '—'}"
-                    for r in rows
-                ]
-                return "Open commitments:\n" + "\n".join(lines)
+                parts = []
+                if rows:
+                    parts.append(
+                        "Open commitments:\n" + "\n".join(
+                            f"  - {r['display_name']} (uid={r['discord_user_id']}): "
+                            f"\"{r['description']}\" due {r['due_at'] or '—'}"
+                            for r in rows
+                        )
+                    )
+                # Daily brief also surfaces pending inbox so the agent can
+                # decide whether anything needs CEO attention.
+                if kind == "daily-brief":
+                    inbox = conn.execute(
+                        "SELECT i.id, i.received_at, "
+                        "       COALESCE(p.display_name, '(unknown)') AS sender, "
+                        "       substr(i.content, 1, 200) AS preview "
+                        "FROM inbox_items i "
+                        "LEFT JOIN people p ON p.id = i.sender_person_id "
+                        "WHERE i.workflow_state = 'pending' "
+                        "ORDER BY i.received_at DESC LIMIT 10"
+                    ).fetchall()
+                    if inbox:
+                        lines = [
+                            f"  - inbox #{r['id']} from {r['sender']} "
+                            f"@ {r['received_at']}: {r['preview']}"
+                            for r in inbox
+                        ]
+                        parts.append(
+                            "Pending inbox items (DMs from non-allowlisted users):\n"
+                            + "\n".join(lines)
+                            + "\n  For each: triage with "
+                            "[[COO_INBOX_HANDLE id=N state=attended|held|no-action|queued "
+                            'note="<short>"]]. Surface anything noteworthy to the CEO; '
+                            "use 'no-action' if it's spam or off-topic."
+                        )
+                return "\n\n".join(parts) if parts else (
+                    "Open commitments: (none recorded)"
+                )
             if kind == "monthly-review":
                 rows = conn.execute(
                     "SELECT m.slug, m.name, m.unit, m.target_value, m.target_direction, "
@@ -1587,6 +1653,15 @@ def _register_cockpit(bot: "COOBot") -> None:
         body = await asyncio.to_thread(_cockpit_cadences, bot.cfg)
         await interaction.followup.send(body or "No cadences seeded.", ephemeral=True)
 
+    @group.command(name="inbox", description="Show pending inbox items from non-allowlisted users.")
+    async def inbox_cmd(interaction: discord.Interaction):
+        if not _gate(interaction):
+            await interaction.response.send_message("Not in the allowlist.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        body = await asyncio.to_thread(_cockpit_inbox, bot.cfg)
+        await interaction.followup.send(body or "Inbox is empty.", ephemeral=True)
+
     bot.tree.add_command(group)
 
 
@@ -1720,6 +1795,28 @@ def _cockpit_decisions(cfg: Config) -> str:
         body += f"\n   _decided {r['decided_at']}_"
         lines.append(body)
     return "**Recent decisions**\n" + "\n\n".join(lines)
+
+
+def _cockpit_inbox(cfg: Config) -> str:
+    tconn = _connect(cfg.tenant_db)
+    try:
+        rows = tconn.execute(
+            "SELECT i.id, i.received_at, i.workflow_state, "
+            "       COALESCE(p.display_name, '(unknown)') AS sender, "
+            "       substr(i.content, 1, 200) AS preview "
+            "FROM inbox_items i LEFT JOIN people p ON p.id = i.sender_person_id "
+            "WHERE i.workflow_state = 'pending' "
+            "ORDER BY i.received_at DESC LIMIT 20"
+        ).fetchall()
+    finally:
+        tconn.close()
+    if not rows:
+        return ""
+    lines = [
+        f"• #{r['id']} _{r['received_at']}_  **{r['sender']}**: {r['preview']}"
+        for r in rows
+    ]
+    return "**Pending inbox**\n" + "\n".join(lines)
 
 
 def _cockpit_cadences(cfg: Config) -> str:

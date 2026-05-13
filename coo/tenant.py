@@ -756,6 +756,409 @@ def metrics_cmd(slug: str):
         click.echo(f"  {r['slug']:<22} {r['name']:<30} → {latest}{target}{anomalies}")
 
 
+@tenant_cmd.command(name="risk-add")
+@click.argument("slug")
+def risk_add_cmd(slug: str):
+    """Add a risk to the tenant's risk register."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+
+    risk_slug = click.prompt("Risk slug (e.g. 'cash-runway')").strip()
+    title = click.prompt("Title").strip()
+    description = click.prompt("Description (blank ok)", default="", show_default=False).strip()
+    category = click.prompt(
+        "Category", default="operational",
+        type=click.Choice(["operational", "financial", "compliance",
+                          "key-person", "security", "market"]),
+    )
+    likelihood = click.prompt(
+        "Likelihood", default="medium", type=click.Choice(["low", "medium", "high"])
+    )
+    impact = click.prompt(
+        "Impact", default="medium", type=click.Choice(["low", "medium", "high"])
+    )
+    mitigation = click.prompt("Mitigation plan (blank ok)", default="", show_default=False).strip()
+    review_cadence = click.prompt(
+        "Review cadence", default="monthly",
+        type=click.Choice(["weekly", "monthly", "quarterly"]),
+    )
+
+    conn = connect(tenant_db)
+    try:
+        existing = conn.execute("SELECT id FROM risks WHERE slug = ?", (risk_slug,)).fetchone()
+        if existing:
+            click.echo(f"Risk slug {risk_slug!r} already exists.", err=True)
+            sys.exit(1)
+        with transaction(conn):
+            conn.execute(
+                "INSERT INTO risks (slug, title, description, category, "
+                "  likelihood, impact, mitigation, review_cadence, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')",
+                (risk_slug, title, description or None, category,
+                 likelihood, impact, mitigation or None, review_cadence),
+            )
+    finally:
+        conn.close()
+    click.echo(f"Added risk {risk_slug!r}.")
+
+
+@tenant_cmd.command(name="risks")
+@click.argument("slug")
+def risks_cmd(slug: str):
+    """List all risks for the tenant."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    conn = connect(tenant_db)
+    rows = conn.execute(
+        "SELECT slug, title, category, likelihood, impact, status, "
+        "       last_reviewed_at, review_cadence "
+        "FROM risks ORDER BY status, slug"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        click.echo("No risks recorded. Use `coo tenant risk-add <slug>`.")
+        return
+    click.echo(
+        f"{'slug':<22}  {'category':<14}  {'lkhd':<6} {'imp':<6} {'status':<10}  last review"
+    )
+    for r in rows:
+        click.echo(
+            f"{r['slug']:<22}  {r['category'] or '-':<14}  "
+            f"{r['likelihood'] or '-':<6} {r['impact'] or '-':<6} "
+            f"{r['status']:<10}  {r['last_reviewed_at'] or 'never'}"
+        )
+
+
+@tenant_cmd.command(name="risk-update")
+@click.argument("slug")
+@click.argument("risk_slug")
+@click.option("--status", type=click.Choice(["open", "mitigated", "accepted", "closed"]))
+@click.option("--reviewed", is_flag=True, help="Stamp last_reviewed_at = now.")
+def risk_update_cmd(slug: str, risk_slug: str, status: str | None, reviewed: bool):
+    """Update a risk's status or mark it reviewed."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    sets = []
+    args: list = []
+    if status:
+        sets.append("status = ?")
+        args.append(status)
+    if reviewed:
+        sets.append("last_reviewed_at = datetime('now')")
+    if not sets:
+        click.echo("Pass --status and/or --reviewed.", err=True)
+        sys.exit(1)
+    args.append(risk_slug)
+    conn = connect(tenant_db)
+    try:
+        with transaction(conn):
+            cur = conn.execute(
+                f"UPDATE risks SET {', '.join(sets)}, updated_at = datetime('now') "
+                f"WHERE slug = ?", args
+            )
+    finally:
+        conn.close()
+    if cur.rowcount == 0:
+        click.echo(f"No risk with slug {risk_slug!r}.", err=True)
+        sys.exit(1)
+    click.echo(f"Updated risk {risk_slug!r}.")
+
+
+@tenant_cmd.command(name="okr-add")
+@click.argument("slug")
+def okr_add_cmd(slug: str):
+    """Add a quarterly objective with key results."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+
+    objective = click.prompt("Objective").strip()
+    description = click.prompt("Description (blank ok)", default="", show_default=False).strip()
+    scope_kind = click.prompt(
+        "Scope", default="company",
+        type=click.Choice(["company", "team", "person"]),
+    )
+    scope_id: int | None = None
+    if scope_kind != "company":
+        scope_raw = click.prompt(
+            "Scope id (team slug, or Discord user id for person)"
+        ).strip()
+        conn = connect(tenant_db)
+        try:
+            if scope_kind == "team":
+                row = conn.execute("SELECT id FROM teams WHERE slug = ?", (scope_raw,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id FROM people WHERE discord_user_id = ?",
+                    (int(scope_raw),),
+                ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            click.echo(f"No {scope_kind} matches {scope_raw!r}.", err=True)
+            sys.exit(1)
+        scope_id = int(row["id"])
+    period = click.prompt("Period (e.g. 'q3-2026')").strip()
+
+    conn = connect(tenant_db)
+    try:
+        with transaction(conn):
+            cur = conn.execute(
+                "INSERT INTO okrs (objective, description, scope_kind, scope_id, "
+                "  period, status) "
+                "VALUES (?, ?, ?, ?, ?, 'active')",
+                (objective, description or None, scope_kind, scope_id, period),
+            )
+            okr_id = cur.lastrowid
+
+            click.echo("Add key results (Ctrl-C when done):")
+            n = 0
+            while True:
+                try:
+                    kr_desc = click.prompt("  KR description").strip()
+                except click.exceptions.Abort:
+                    click.echo("")
+                    break
+                target_raw = click.prompt(
+                    "  KR target value (blank ok)", default="", show_default=False
+                ).strip()
+                target = float(target_raw) if target_raw else None
+                conn.execute(
+                    "INSERT INTO key_results (okr_id, description, target_value, status) "
+                    "VALUES (?, ?, ?, 'on-track')",
+                    (okr_id, kr_desc, target),
+                )
+                n += 1
+                if not click.confirm("  Add another KR?", default=True):
+                    break
+    finally:
+        conn.close()
+    click.echo(f"Added OKR (id={okr_id}) with {n} key result(s).")
+
+
+@tenant_cmd.command(name="okrs")
+@click.argument("slug")
+def okrs_cmd(slug: str):
+    """List OKRs and their key results."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    conn = connect(tenant_db)
+    okrs = conn.execute(
+        "SELECT id, objective, scope_kind, scope_id, period, status, "
+        "       grade_text, grade_value "
+        "FROM okrs ORDER BY period DESC, id DESC"
+    ).fetchall()
+    if not okrs:
+        click.echo("No OKRs defined. Use `coo tenant okr-add <slug>`.")
+        conn.close()
+        return
+    for o in okrs:
+        grade = (
+            f"  graded: {o['grade_value']} — {o['grade_text']}"
+            if o["grade_value"] is not None else ""
+        )
+        click.echo(
+            f"\n#{o['id']}  [{o['scope_kind']}] {o['period']}  {o['status']}\n"
+            f"  Objective: {o['objective']}{grade}"
+        )
+        krs = conn.execute(
+            "SELECT description, target_value, current_value, status "
+            "FROM key_results WHERE okr_id = ? ORDER BY id",
+            (o["id"],),
+        ).fetchall()
+        for k in krs:
+            tgt = f" (target {k['target_value']})" if k["target_value"] is not None else ""
+            cur = f" → {k['current_value']}" if k["current_value"] is not None else ""
+            click.echo(f"    - [{k['status']:<10}] {k['description']}{tgt}{cur}")
+    conn.close()
+
+
+@tenant_cmd.command(name="okr-grade")
+@click.argument("slug")
+@click.argument("okr_id", type=int)
+@click.argument("grade_value", type=float)
+@click.option("--text", default="", help="Short narrative of how grading went.")
+def okr_grade_cmd(slug: str, okr_id: int, grade_value: float, text: str):
+    """Grade an OKR 0.0–1.0 with optional narrative."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    if not 0.0 <= grade_value <= 1.0:
+        click.echo("grade_value must be between 0.0 and 1.0.", err=True)
+        sys.exit(1)
+    conn = connect(tenant_db)
+    try:
+        with transaction(conn):
+            cur = conn.execute(
+                "UPDATE okrs SET status = 'graded', grade_value = ?, "
+                "  grade_text = ?, graded_at = datetime('now') "
+                "WHERE id = ?",
+                (grade_value, text or None, okr_id),
+            )
+    finally:
+        conn.close()
+    if cur.rowcount == 0:
+        click.echo(f"No OKR with id={okr_id}.", err=True)
+        sys.exit(1)
+    click.echo(f"Graded OKR #{okr_id}: {grade_value} — {text or '(no text)'}")
+
+
+@tenant_cmd.command(name="summary")
+@click.argument("slug")
+def summary_cmd(slug: str):
+    """Full dashboard for a tenant — phase, people, facts, commitments, etc."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+
+    def section(title: str):
+        click.echo("")
+        click.echo(click.style(f"━━ {title}", fg="cyan"))
+
+    pconn = connect(platform_db_path())
+    t = pconn.execute(
+        "SELECT phase, status, schema_version, created_at FROM tenants WHERE slug = ?",
+        (slug,),
+    ).fetchone()
+    pconn.close()
+    click.echo(click.style(
+        f"\n  Tenant: {slug}  ({tenant['company_name']})", bold=True
+    ))
+    click.echo(
+        f"  Phase: {t['phase']}   Status: {t['status']}   "
+        f"Schema: v{t['schema_version']}   Created: {t['created_at']}"
+    )
+
+    conn = connect(tenant_db)
+    try:
+        people = conn.execute(
+            "SELECT p.slug, p.display_name, p.role, p.access_tier, t.slug AS team "
+            "FROM people p LEFT JOIN teams t ON p.team_id = t.id "
+            "WHERE p.deleted_at IS NULL ORDER BY p.id"
+        ).fetchall()
+        section(f"People ({len(people)})")
+        for p in people:
+            team = f"  ({p['team']})" if p["team"] else ""
+            click.echo(
+                f"  {p['display_name']} — {p['role'] or '?'}{team}  [tier={p['access_tier']}]"
+            )
+
+        facts = conn.execute(
+            "SELECT subject_kind, subject_id, predicate, object_text "
+            "FROM facts WHERE is_current = 1 ORDER BY id DESC LIMIT 15"
+        ).fetchall()
+        section(f"Recent facts ({len(facts)} shown)")
+        for f in facts:
+            sid = f":{f['subject_id']}" if f["subject_id"] else ""
+            click.echo(f"  • {f['subject_kind']}{sid}  {f['predicate']} = {f['object_text']}")
+
+        commits = conn.execute(
+            "SELECT c.description, c.due_at, p.display_name "
+            "FROM commitments c JOIN people p ON p.id = c.person_id "
+            "WHERE c.status = 'open' ORDER BY c.due_at"
+        ).fetchall()
+        section(f"Open commitments ({len(commits)})")
+        for c in commits:
+            click.echo(f"  • {c['display_name']}: {c['description']}  (due {c['due_at'] or '—'})")
+
+        decisions = conn.execute(
+            "SELECT title, decision_text, decided_at FROM decisions "
+            "WHERE is_current = 1 ORDER BY decided_at DESC LIMIT 5"
+        ).fetchall()
+        section(f"Recent decisions ({len(decisions)} shown)")
+        for d in decisions:
+            click.echo(f"  • [{d['decided_at']}] {d['title']} — {d['decision_text']}")
+
+        risks = conn.execute(
+            "SELECT slug, title, likelihood, impact, status FROM risks "
+            "WHERE status IN ('open', 'mitigated') ORDER BY id"
+        ).fetchall()
+        section(f"Open risks ({len(risks)})")
+        for r in risks:
+            click.echo(
+                f"  • {r['slug']}: {r['title']}  "
+                f"[lkhd={r['likelihood']}, imp={r['impact']}, {r['status']}]"
+            )
+
+        okrs = conn.execute(
+            "SELECT id, objective, period, status FROM okrs "
+            "WHERE status IN ('draft', 'active') ORDER BY period DESC LIMIT 5"
+        ).fetchall()
+        section(f"Active OKRs ({len(okrs)})")
+        for o in okrs:
+            click.echo(f"  • #{o['id']}  [{o['period']}]  {o['objective']}  ({o['status']})")
+
+        metrics = conn.execute(
+            "SELECT m.slug, m.unit, "
+            "       (SELECT value FROM metric_values WHERE metric_id = m.id "
+            "        ORDER BY observed_at DESC LIMIT 1) AS latest, "
+            "       (SELECT observed_at FROM metric_values WHERE metric_id = m.id "
+            "        ORDER BY observed_at DESC LIMIT 1) AS at "
+            "FROM metrics m WHERE m.is_active = 1 ORDER BY m.id"
+        ).fetchall()
+        section(f"Metrics ({len(metrics)})")
+        for m in metrics:
+            if m["latest"] is None:
+                click.echo(f"  • {m['slug']}: no data yet")
+            else:
+                click.echo(f"  • {m['slug']}: {m['latest']}{m['unit'] or ''} @ {m['at']}")
+
+        cadences = conn.execute(
+            "SELECT slug, kind, next_fire_at FROM cadences "
+            "WHERE is_active = 1 AND next_fire_at IS NOT NULL "
+            "ORDER BY next_fire_at LIMIT 5"
+        ).fetchall()
+        section(f"Next cadences ({len(cadences)} shown)")
+        for c in cadences:
+            click.echo(f"  • {c['slug']} ({c['kind']}) @ {c['next_fire_at']} UTC")
+
+        pending_nudges = conn.execute(
+            "SELECT COUNT(*) AS n FROM scheduled_contacts WHERE status = 'pending'"
+        ).fetchone()["n"]
+        click.echo("")
+        click.echo(f"  Pending nudges: {pending_nudges}")
+    finally:
+        conn.close()
+
+
+@tenant_cmd.command(name="inbox")
+@click.argument("slug")
+@click.option("--state", help="Filter by workflow_state (pending|queued|held|attended|...).")
+@click.option("--limit", default=20, type=int)
+def inbox_cmd(slug: str, state: str | None, limit: int):
+    """Show inbox items (DMs from non-allowlist users)."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    conn = connect(tenant_db)
+    q = (
+        "SELECT i.id, i.received_at, i.workflow_state, "
+        "       COALESCE(p.display_name, '(unknown)') AS sender, "
+        "       substr(i.content, 1, 100) AS preview "
+        "FROM inbox_items i LEFT JOIN people p ON p.id = i.sender_person_id"
+    )
+    args: list = []
+    if state:
+        q += " WHERE i.workflow_state = ?"
+        args.append(state)
+    q += " ORDER BY i.received_at DESC LIMIT ?"
+    args.append(limit)
+    rows = conn.execute(q, args).fetchall()
+    conn.close()
+    if not rows:
+        click.echo("Inbox is empty" + (f" for state={state}" if state else "") + ".")
+        return
+    for r in rows:
+        click.echo(
+            f"  #{r['id']:<4} [{r['workflow_state']:<9}] {r['received_at']}  "
+            f"{r['sender']}: {r['preview']}"
+        )
+
+
 @tenant_cmd.command(name="stop")
 @click.argument("slug")
 def stop_cmd(slug: str):
