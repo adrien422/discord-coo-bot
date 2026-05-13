@@ -3,6 +3,7 @@ import click
 from . import __version__
 from .developer import developer_cmd
 from .install import install_cmd
+from .integration import integration_cmd
 from .tenant import tenant_cmd
 
 
@@ -20,6 +21,7 @@ def platform_grp():
 platform_grp.add_command(install_cmd)
 cli.add_command(developer_cmd)
 cli.add_command(tenant_cmd)
+cli.add_command(integration_cmd)
 
 
 if __name__ == "__main__":

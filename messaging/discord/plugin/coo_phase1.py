@@ -80,6 +80,10 @@ COO_INBOX_HANDLE_RE = re.compile(
     r'\[\[COO_INBOX_HANDLE\s+id=(\d+)\s+state=(attended|held|no-action|queued)'
     r'(?:\s+note="([^"]*)")?\]\]'
 )
+COO_QUERY_APP_RE = re.compile(r"\[\[COO_QUERY_APP\s+slug=(\w+)\s+query=([^\]]+)\]\]")
+COO_APP_ACTION_RE = re.compile(
+    r"\[\[COO_APP_ACTION\s+slug=(\w+)\s+action=(\w+)(?:\s+args='([^']*)')?\]\]"
+)
 PHASE_APPROVAL_RE = re.compile(r"\bapprove\s+phase\s+([2-9])\b", re.I)
 
 
@@ -198,6 +202,42 @@ class Config:
             run_ai=req("DISCORD_COO_RUN_AI"),
             agent_kind=os.environ.get("DISCORD_COO_AGENT_KIND", "claude"),
         )
+
+
+def _integrations_dir() -> Path:
+    # repo_root/messaging/discord/plugin/coo_phase1.py -> repo_root
+    return Path(__file__).resolve().parents[3] / "integrations"
+
+
+def _load_integration_manifest(slug: str) -> dict | None:
+    p = _integrations_dir() / slug / "manifest.json"
+    if not p.exists():
+        return None
+    return json.loads(p.read_text())
+
+
+def _load_integration_plugin(slug: str):
+    import importlib.util
+    init = _integrations_dir() / slug / "plugin" / "__init__.py"
+    if not init.exists():
+        return None
+    spec = importlib.util.spec_from_file_location(f"_int_{slug}", init)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_integration_creds(tenant_dir: Path, slug: str) -> dict | None:
+    p = tenant_dir / "integrations" / slug / "credentials.json"
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def _save_integration_creds(tenant_dir: Path, slug: str, creds: dict) -> None:
+    d = tenant_dir / "integrations" / slug
+    d.mkdir(parents=True, mode=0o700, exist_ok=True)
+    p = d / "credentials.json"
+    p.write_text(json.dumps(creds))
+    p.chmod(0o600)
 
 
 def _connect(db: Path) -> sqlite3.Connection:
@@ -526,6 +566,14 @@ once.
   - `[[COO_INBOX_HANDLE id=N state=attended|held|no-action|queued note="<short>"]]`
        — triage an inbox item (DM from a non-allowlisted user). The daily
        brief surfaces pending inbox items; you decide what to do with each.
+  - `[[COO_APP_ACTION slug=<integration> action=<name> args='{...}']]`
+       — take an action in an enabled integration (e.g., HubSpot create_note).
+       The bridge validates that:
+         (1) the integration is connected for this tenant,
+         (2) the action is whitelisted in the integration's manifest,
+         (3) the most recent message asserter is in the integration's
+             scoped team, OR is the CEO, OR is a developer.
+       Result lands as a [[BRIDGE_APP_ACTION_RESULT]] notice.
   - `[[COO_HOLD]]` — park the thread without action
   - `NOOP` — valid full reply when there is nothing to do
 
@@ -668,6 +716,9 @@ class COOBot(discord.Client):
         self._capture_task: asyncio.Task | None = None
         self._schedule_task: asyncio.Task | None = None
         self._cadence_task: asyncio.Task | None = None
+        self._integration_task: asyncio.Task | None = None
+        # tracks last sync time per integration_slug to enforce cadence
+        self._integration_last_sync: dict[str, float] = {}
         self.first_start_marker = cfg.state_dir / "first_start_done"
         self._delivered_path = cfg.state_dir / "delivered.json"
         self._last_delivered: dict[int, str] = self._load_delivered()
@@ -1009,6 +1060,7 @@ class COOBot(discord.Client):
         self._capture_task = asyncio.create_task(self._capture_loop())
         self._schedule_task = asyncio.create_task(self._schedule_loop())
         self._cadence_task = asyncio.create_task(self._cadence_loop())
+        self._integration_task = asyncio.create_task(self._integration_loop())
 
     async def _send_initial_mission(self) -> None:
         prompt = mission_prompt(self.cfg, self.allowlist, self.ceo, self.company)
@@ -1193,6 +1245,12 @@ class COOBot(discord.Client):
             new_state = m.group(2)
             note = m.group(3)
             await asyncio.to_thread(self._handle_inbox_item, item_id, new_state, note)
+
+        for m in COO_APP_ACTION_RE.finditer(response):
+            slug = m.group(1)
+            action = m.group(2)
+            args_json = m.group(3) or ""
+            asyncio.create_task(self._handle_app_action(slug, action, args_json))
 
         if fact_count or commit_count or decision_count:
             logger.info(
@@ -1479,6 +1537,172 @@ class COOBot(discord.Client):
             row["slug"], kind, row["run_id"],
         )
         await self._send_to_agent(notice, cancel_first=False)
+
+    # ----- app integrations (HubSpot etc.) -----
+
+    async def _integration_loop(self) -> None:
+        """Every 60s, sync any connected integrations whose cadence is due."""
+        await asyncio.sleep(45)  # offset from schedule + cadence loops
+        while not self.is_closed():
+            try:
+                await asyncio.to_thread(self._run_due_integrations)
+            except Exception:
+                logger.exception("integration loop error")
+            await asyncio.sleep(60)
+
+    def _run_due_integrations(self) -> None:
+        connected = self._enabled_integrations()
+        now = time.time()
+        for ig in connected:
+            slug = ig["integration_slug"]
+            mani = _load_integration_manifest(slug)
+            if mani is None:
+                continue
+            cadence = int(mani.get("sync_cadence_seconds") or 3600)
+            last = self._integration_last_sync.get(slug, 0)
+            if now - last < cadence:
+                continue
+            self._integration_last_sync[slug] = now
+            self._run_one_integration(ig, mani)
+
+    def _run_one_integration(self, ig: dict, mani: dict) -> None:
+        slug = ig["integration_slug"]
+        team = ig["scoped_team_slug"]
+        plugin = _load_integration_plugin(slug)
+        if plugin is None:
+            return
+        tenant_dir = self._tenant_dir
+        creds = _load_integration_creds(tenant_dir, slug) or {}
+        try:
+            result = plugin.sync(str(self.cfg.tenant_db), team, creds)
+            if isinstance(result, dict) and "creds_refreshed" in result:
+                _save_integration_creds(tenant_dir, slug, result.pop("creds_refreshed"))
+            logger.info("integration sync %s OK: %s", slug, json.dumps(result))
+            self._audit_integration(slug, "integration_sync_ok", result)
+        except Exception as e:
+            logger.exception("integration sync %s failed", slug)
+            self._audit_integration(slug, "integration_sync_failed", {"error": str(e)})
+
+    def _enabled_integrations(self) -> list[dict]:
+        pconn = _connect(self.cfg.platform_db)
+        try:
+            t = pconn.execute(
+                "SELECT id FROM tenants WHERE slug = ?", (self.cfg.tenant_slug,)
+            ).fetchone()
+            if not t:
+                return []
+            rows = pconn.execute(
+                "SELECT integration_slug, scoped_team_slug, status "
+                "FROM tenant_apps WHERE tenant_id = ? AND status = 'connected'",
+                (t["id"],),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            pconn.close()
+
+    def _audit_integration(self, slug: str, action: str, payload: dict) -> None:
+        pconn = _connect(self.cfg.platform_db)
+        try:
+            with pconn:
+                t = pconn.execute(
+                    "SELECT id FROM tenants WHERE slug = ?",
+                    (self.cfg.tenant_slug,),
+                ).fetchone()
+                if not t:
+                    return
+                payload = dict(payload)
+                payload["slug"] = slug
+                pconn.execute(
+                    "INSERT INTO platform_audit (action, tenant_id, payload_json) "
+                    "VALUES (?, ?, ?)",
+                    (action, t["id"], json.dumps(payload, default=str)),
+                )
+        finally:
+            pconn.close()
+
+    def _integration_scope_ok(self, slug: str) -> bool:
+        """True if the most recent message asserter is allowed to drive
+        actions for this integration (a member of its scoped team, or
+        the CEO, or any developer)."""
+        if self._last_asserter_person_id is None:
+            return False
+        for ig in self._enabled_integrations():
+            if ig["integration_slug"] != slug:
+                continue
+            scope_team = ig["scoped_team_slug"]
+            conn = _connect(self.cfg.tenant_db)
+            try:
+                row = conn.execute(
+                    "SELECT p.discord_user_id, p.access_tier, t.slug AS team_slug "
+                    "FROM people p LEFT JOIN teams t ON t.id = p.team_id "
+                    "WHERE p.id = ?",
+                    (self._last_asserter_person_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if not row:
+                return False
+            uid = int(row["discord_user_id"]) if row["discord_user_id"] else None
+            if uid is not None and self.allowlist.get(uid, {}).get("tier") == "developer":
+                return True
+            if row["access_tier"] == "admin":  # CEO
+                return True
+            if scope_team and row["team_slug"] == scope_team:
+                return True
+            return False
+        return False
+
+    async def _handle_app_action(self, slug: str, action: str, args_json: str) -> None:
+        if not self._integration_scope_ok(slug):
+            logger.warning("app action denied (scope): slug=%s action=%s", slug, action)
+            await self._send_to_agent(
+                f"[[BRIDGE_APP_ACTION_DENIED slug={slug} action={action}]]\n\n"
+                "Action refused: the asserter is not a member of the integration's "
+                "scoped team (and is not the CEO or a developer). Tell the asserter "
+                "to ask someone in scope to issue the command, or get the team "
+                "scoping updated.",
+                cancel_first=False,
+            )
+            return
+        manifest = await asyncio.to_thread(_load_integration_manifest, slug)
+        if not manifest or action not in manifest.get("actions", []):
+            await self._send_to_agent(
+                f"[[BRIDGE_APP_ACTION_DENIED slug={slug} action={action}]]\n\n"
+                "Action refused: not whitelisted in the integration's manifest.",
+                cancel_first=False,
+            )
+            return
+        try:
+            args = json.loads(args_json) if args_json else {}
+        except Exception:
+            args = {}
+        plugin = await asyncio.to_thread(_load_integration_plugin, slug)
+        creds = await asyncio.to_thread(
+            _load_integration_creds, self._tenant_dir, slug
+        ) or {}
+        try:
+            fn = getattr(plugin, action)
+            result = await asyncio.to_thread(fn, creds, **args)
+            await asyncio.to_thread(
+                self._audit_integration, slug, "integration_action_ok",
+                {"action": action, "args": args},
+            )
+            await self._send_to_agent(
+                f"[[BRIDGE_APP_ACTION_RESULT slug={slug} action={action}]]\n\n"
+                f"Action succeeded. Result summary: {json.dumps(result)[:400]}",
+                cancel_first=False,
+            )
+        except Exception as e:
+            logger.exception("app action %s.%s failed", slug, action)
+            await asyncio.to_thread(
+                self._audit_integration, slug, "integration_action_failed",
+                {"action": action, "error": str(e)},
+            )
+            await self._send_to_agent(
+                f"[[BRIDGE_APP_ACTION_FAILED slug={slug} action={action}]]\n\n"
+                f"Action failed: {e}",
+                cancel_first=False,
+            )
 
     async def _schedule_loop(self) -> None:
         """Every 60s, fire any scheduled_contacts that are due."""

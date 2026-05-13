@@ -1,0 +1,18 @@
+{
+  "slug": "hubspot",
+  "name": "HubSpot CRM",
+  "version": "1",
+  "description": "Pulls deals + contacts; computes pipeline value, open deal count, mean deal size.",
+  "needs_oauth": true,
+  "oauth": {
+    "authorize_url": "https://app.hubspot.com/oauth/authorize",
+    "token_url": "https://api.hubapi.com/oauth/v1/token",
+    "scopes": [
+      "crm.objects.deals.read",
+      "crm.objects.contacts.read",
+      "crm.objects.companies.read"
+    ]
+  },
+  "sync_cadence_seconds": 900,
+  "actions": ["create_note", "update_deal_stage"]
+}
