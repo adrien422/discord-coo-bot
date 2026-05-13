@@ -27,6 +27,30 @@ Each row is a self-contained commit on the `multi-tenant-redesign` branch (PR #1
 | N | Tenant summary | `coo tenant summary <slug>` — full dashboard for one tenant. |
 | O | Workflows + tasks + reports | `[[COO_WORKFLOW]]` / `[[COO_TASK]]` / `[[COO_REPORT]]` markers. Reports mirror to disk under `tenants/<slug>/reports/<kind>/`. `coo tenant workflows/tasks/reports`. |
 | R | Docs refresh | This file + the new top-level README. ARCHITECTURE.md updated with "what's shipped". |
+| W | Dynamic 4-mode integrations | Replaces per-app plugins as default. `mcp` / `http` / `plugin` / `manual`. New `coo integration connect --mode`, `coo tenant tools`, generic HTTP client + `[[COO_HTTP_CALL]]` marker. HubSpot plugin demoted to hint-only catalog entry. |
+| X | systemd-user units | `coo tenant start/stop` switches to `systemctl --user`. Restart-on-failure verified by killing the bot — systemd respawned in 12s. OnFailure hook writes to a centralised tenant-failures log. |
+| Y | pytest smoke suite | 24 tests covering schemas, marker parsers, normalize_message_text, action-pattern matcher, scope resolution, DB write helpers, freshness dedup. All pass in ~1.3s. |
+| Z | Health checks | `coo tenant health <slug>` runs ~8 checks (runtime, DB integrity, recent activity, stale cadences, inbox backlog, log presence, secrets perms). `coo platform health` summarises all tenants. systemd OnFailure → log line in `~/.local/share/coo/platform/tenant-failures.log`. |
+| AA | Two-tenant isolation proof | Bootstrapped a synthetic `globex` tenant alongside `dan-test`. Verified live: separate dirs, separate DBs, separate `.claude/` config, separate `secrets.env`, separate systemd unit instances. Distinct `isolation_marker` facts written to each — no cross-contamination. Architecture's multi-tenant claim now empirically validated. |
+
+## v1 status
+
+The five completion criteria laid out at the start of the loop have all
+landed. The system is **ready for a first real-user test** under the
+following conditions:
+
+- Operator (Dan or Adrien) drives bootstrap, integration connection, and
+  Phase-2 unlocks.
+- One real Discord guild per tenant; bot token + guild + home channel
+  configured at `coo tenant new` time.
+- HubSpot or other apps reached via MCP / HTTP modes — operator picks
+  per company.
+- Bot runs under `systemctl --user`; survives crashes and most VM
+  reboots (linger off by default; `loginctl enable-linger` for full
+  reboot survival).
+- `coo tenant health` and `coo platform health` for ops inspection.
+- `tenant-failures.log` for crash-history surface; replace the
+  OnFailure oneshot with a real notification path for production.
 
 ## Open / not yet built
 
