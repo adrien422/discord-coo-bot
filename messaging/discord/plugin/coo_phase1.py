@@ -651,6 +651,8 @@ class COOBot(discord.Client):
         intents.dm_messages = True
         intents.members = True
         super().__init__(intents=intents)
+        # app_commands tree for /coo slash commands
+        self.tree = discord.app_commands.CommandTree(self)
         self.cfg = cfg
         self.allowlist = load_allowlist(cfg)
         self.ceo = load_ceo(cfg)
@@ -948,6 +950,15 @@ class COOBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self._session_was_new = self.bridge.ensure_session()
+        # Register cockpit slash commands on the tenant's guild for fast rollout.
+        _register_cockpit(self)
+        guild = discord.Object(id=self.cfg.guild_id)
+        self.tree.copy_global_to(guild=guild)
+        try:
+            synced = await self.tree.sync(guild=guild)
+            logger.info("slash commands synced: %d", len(synced))
+        except Exception:
+            logger.exception("slash command sync failed")
 
     async def on_ready(self) -> None:
         logger.info("Discord ready as %s (id=%s)", self.user, self.user.id if self.user else "?")
@@ -1506,6 +1517,229 @@ class COOBot(discord.Client):
             logger.info("scheduled contact uid=%s in %ss: %s", uid, secs, reason)
         finally:
             tconn.close()
+
+
+# -------------------- discord cockpit (/coo slash commands) --------------------
+
+
+def _register_cockpit(bot: "COOBot") -> None:
+    """Register /coo slash commands on the bot's CommandTree.
+
+    Commands are guild-scoped to the tenant's guild so they roll out instantly
+    (global commands take up to an hour to propagate). All replies are
+    ephemeral (only the invoker sees them).
+    """
+    group = discord.app_commands.Group(name="coo", description="COO agent cockpit")
+
+    def _gate(interaction: discord.Interaction) -> bool:
+        """Only allowlisted users can use cockpit commands."""
+        bot.allowlist = load_allowlist(bot.cfg)
+        return interaction.user.id in bot.allowlist
+
+    @group.command(name="status", description="Tenant phase, cadences, and quick counters.")
+    async def status_cmd(interaction: discord.Interaction):
+        if not _gate(interaction):
+            await interaction.response.send_message(
+                "Not in the allowlist.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await asyncio.to_thread(_cockpit_status, bot.cfg)
+        embed = discord.Embed(title=f"COO status — {bot.company}", color=0x4F46E5)
+        for k, v in rows:
+            embed.add_field(name=k, value=v, inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @group.command(name="facts", description="List recent facts (latest first).")
+    @discord.app_commands.describe(subject="Optional filter: 'company', a person uid, or a team slug.")
+    async def facts_cmd(interaction: discord.Interaction, subject: str | None = None):
+        if not _gate(interaction):
+            await interaction.response.send_message("Not in the allowlist.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        body = await asyncio.to_thread(_cockpit_facts, bot.cfg, subject)
+        await interaction.followup.send(body or "No facts recorded yet.", ephemeral=True)
+
+    @group.command(name="commitments", description="Open commitments by owner.")
+    async def commitments_cmd(interaction: discord.Interaction):
+        if not _gate(interaction):
+            await interaction.response.send_message("Not in the allowlist.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        body = await asyncio.to_thread(_cockpit_commitments, bot.cfg)
+        await interaction.followup.send(body or "No open commitments.", ephemeral=True)
+
+    @group.command(name="decisions", description="Recent decisions log.")
+    async def decisions_cmd(interaction: discord.Interaction):
+        if not _gate(interaction):
+            await interaction.response.send_message("Not in the allowlist.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        body = await asyncio.to_thread(_cockpit_decisions, bot.cfg)
+        await interaction.followup.send(body or "No decisions recorded yet.", ephemeral=True)
+
+    @group.command(name="cadences", description="Scheduled cadences and next fire times.")
+    async def cadences_cmd(interaction: discord.Interaction):
+        if not _gate(interaction):
+            await interaction.response.send_message("Not in the allowlist.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        body = await asyncio.to_thread(_cockpit_cadences, bot.cfg)
+        await interaction.followup.send(body or "No cadences seeded.", ephemeral=True)
+
+    bot.tree.add_command(group)
+
+
+def _cockpit_status(cfg: Config) -> list[tuple[str, str]]:
+    pconn = _connect(cfg.platform_db)
+    try:
+        phase = pconn.execute(
+            "SELECT phase, status FROM tenants WHERE slug = ?", (cfg.tenant_slug,)
+        ).fetchone()
+    finally:
+        pconn.close()
+
+    tconn = _connect(cfg.tenant_db)
+    try:
+        people = tconn.execute("SELECT COUNT(*) AS n FROM people WHERE deleted_at IS NULL").fetchone()["n"]
+        facts = tconn.execute("SELECT COUNT(*) AS n FROM facts WHERE is_current = 1").fetchone()["n"]
+        commits = tconn.execute("SELECT COUNT(*) AS n FROM commitments WHERE status = 'open'").fetchone()["n"]
+        overdue = tconn.execute(
+            "SELECT COUNT(*) AS n FROM commitments "
+            "WHERE status = 'open' AND due_at IS NOT NULL AND due_at < date('now')"
+        ).fetchone()["n"]
+        decisions = tconn.execute("SELECT COUNT(*) AS n FROM decisions WHERE is_current = 1").fetchone()["n"]
+        pending_nudges = tconn.execute(
+            "SELECT COUNT(*) AS n FROM scheduled_contacts WHERE status = 'pending'"
+        ).fetchone()["n"]
+        next_cadence = tconn.execute(
+            "SELECT slug, next_fire_at FROM cadences "
+            "WHERE is_active = 1 AND next_fire_at IS NOT NULL "
+            "ORDER BY next_fire_at ASC LIMIT 1"
+        ).fetchone()
+    finally:
+        tconn.close()
+
+    rows = [
+        ("Phase", f"{phase['phase']} ({phase['status']})" if phase else "?"),
+        ("People", str(people)),
+        ("Facts (current)", str(facts)),
+        ("Commitments (open)", f"{commits} ({overdue} overdue)" if overdue else str(commits)),
+        ("Decisions", str(decisions)),
+        ("Pending nudges", str(pending_nudges)),
+    ]
+    if next_cadence:
+        rows.append((
+            "Next cadence",
+            f"{next_cadence['slug']} at {next_cadence['next_fire_at']} UTC",
+        ))
+    return rows
+
+
+def _cockpit_facts(cfg: Config, subject: str | None) -> str:
+    tconn = _connect(cfg.tenant_db)
+    try:
+        if subject is None:
+            rows = tconn.execute(
+                "SELECT subject_kind, subject_id, predicate, object_text "
+                "FROM facts WHERE is_current = 1 ORDER BY id DESC LIMIT 25"
+            ).fetchall()
+        elif subject.lower() == "company":
+            rows = tconn.execute(
+                "SELECT subject_kind, subject_id, predicate, object_text "
+                "FROM facts WHERE is_current = 1 AND subject_kind = 'company' "
+                "ORDER BY id DESC LIMIT 25"
+            ).fetchall()
+        elif subject.isdigit():
+            p = tconn.execute(
+                "SELECT id FROM people WHERE discord_user_id = ?", (int(subject),)
+            ).fetchone()
+            rows = tconn.execute(
+                "SELECT subject_kind, subject_id, predicate, object_text "
+                "FROM facts WHERE is_current = 1 AND subject_kind='person' AND subject_id = ? "
+                "ORDER BY id DESC LIMIT 25",
+                (p["id"] if p else -1,),
+            ).fetchall()
+        else:
+            t = tconn.execute("SELECT id FROM teams WHERE slug = ?", (subject,)).fetchone()
+            rows = tconn.execute(
+                "SELECT subject_kind, subject_id, predicate, object_text "
+                "FROM facts WHERE is_current = 1 AND subject_kind='team' AND subject_id = ? "
+                "ORDER BY id DESC LIMIT 25",
+                (t["id"] if t else -1,),
+            ).fetchall()
+    finally:
+        tconn.close()
+    if not rows:
+        return ""
+    lines = []
+    for r in rows:
+        sk = r["subject_kind"]
+        sid = r["subject_id"] or ""
+        lines.append(f"• {sk}{(':'+str(sid)) if sid else ''} — `{r['predicate']}` = {r['object_text']}")
+    return "**Facts**\n" + "\n".join(lines)
+
+
+def _cockpit_commitments(cfg: Config) -> str:
+    tconn = _connect(cfg.tenant_db)
+    try:
+        rows = tconn.execute(
+            "SELECT c.description, c.due_at, c.status, p.display_name, "
+            "       p.discord_user_id "
+            "FROM commitments c JOIN people p ON p.id = c.person_id "
+            "WHERE c.status = 'open' "
+            "ORDER BY c.due_at IS NULL, c.due_at ASC LIMIT 25"
+        ).fetchall()
+    finally:
+        tconn.close()
+    if not rows:
+        return ""
+    lines = []
+    for r in rows:
+        due = r["due_at"] or "—"
+        lines.append(f"• **{r['display_name']}** — {r['description']} _(due {due})_")
+    return "**Open commitments**\n" + "\n".join(lines)
+
+
+def _cockpit_decisions(cfg: Config) -> str:
+    tconn = _connect(cfg.tenant_db)
+    try:
+        rows = tconn.execute(
+            "SELECT title, decision_text, rationale, decided_at "
+            "FROM decisions WHERE is_current = 1 ORDER BY decided_at DESC LIMIT 15"
+        ).fetchall()
+    finally:
+        tconn.close()
+    if not rows:
+        return ""
+    lines = []
+    for r in rows:
+        body = f"• **{r['title']}** — {r['decision_text']}"
+        if r["rationale"]:
+            body += f"\n   _why: {r['rationale']}_"
+        body += f"\n   _decided {r['decided_at']}_"
+        lines.append(body)
+    return "**Recent decisions**\n" + "\n\n".join(lines)
+
+
+def _cockpit_cadences(cfg: Config) -> str:
+    tconn = _connect(cfg.tenant_db)
+    try:
+        rows = tconn.execute(
+            "SELECT slug, kind, next_fire_at, last_fired_at "
+            "FROM cadences WHERE is_active = 1 "
+            "ORDER BY next_fire_at IS NULL DESC, next_fire_at ASC"
+        ).fetchall()
+    finally:
+        tconn.close()
+    if not rows:
+        return ""
+    lines = []
+    for r in rows:
+        nxt = r["next_fire_at"] or "—"
+        last = r["last_fired_at"] or "never"
+        lines.append(f"• `{r['slug']}` ({r['kind']}) → next **{nxt}**  · last {last}")
+    return "**Cadences**\n" + "\n".join(lines)
 
 
 def configure_logging() -> None:
