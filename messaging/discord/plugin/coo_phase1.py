@@ -93,6 +93,10 @@ COO_QUERY_APP_RE = re.compile(r"\[\[COO_QUERY_APP\s+slug=(\w+)\s+query=([^\]]+)\
 COO_APP_ACTION_RE = re.compile(
     r"\[\[COO_APP_ACTION\s+slug=(\w+)\s+action=(\w+)(?:\s+args='([^']*)')?\]\]"
 )
+COO_HTTP_CALL_RE = re.compile(
+    r"\[\[COO_HTTP_CALL\s+slug=(\w+)\s+method=(GET|POST|PUT|PATCH|DELETE)"
+    r"\s+path=(\S+)(?:\s+body='([^']*)')?\]\]"
+)
 COO_WORKFLOW_RE = re.compile(r"\[\[COO_WORKFLOW\s+(.+?)\]\]")
 COO_TASK_RE = re.compile(r"\[\[COO_TASK\s+(.+?)\]\]")
 COO_REPORT_RE = re.compile(
@@ -244,6 +248,39 @@ def _load_integration_plugin(slug: str):
 def _load_integration_creds(tenant_dir: Path, slug: str) -> dict | None:
     p = tenant_dir / "integrations" / slug / "credentials.json"
     return json.loads(p.read_text()) if p.exists() else None
+
+
+def _match_action(wanted: str, pattern: str) -> bool:
+    """Wildcard-tolerant match for 'METHOD:path' patterns. '*' matches one segment."""
+    if "*" not in pattern:
+        return wanted == pattern
+    re_pat = re.escape(pattern).replace(r"\*", "[^/]+")
+    return re.fullmatch(re_pat, wanted) is not None
+
+
+def _http_call(
+    base_url: str, method: str, path: str, body: str,
+    auth_scheme: str, header_name: str, token: str,
+) -> dict:
+    """Generic HTTP client used by the http-mode integration path."""
+    import urllib.request
+    import urllib.parse
+    url = base_url.rstrip("/") + "/" + path.lstrip("/")
+    headers = {"Content-Type": "application/json"}
+    if auth_scheme == "bearer":
+        headers["Authorization"] = f"Bearer {token}"
+    elif auth_scheme == "api_key_header" and header_name:
+        headers[header_name] = token
+    elif auth_scheme == "basic":
+        import base64
+        headers["Authorization"] = "Basic " + base64.b64encode(token.encode()).decode()
+    data = body.encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return {"status": resp.status, "body": resp.read().decode("utf-8", "replace")}
+    except urllib.request.HTTPError as e:
+        return {"status": e.code, "body": e.read().decode("utf-8", "replace")}
 
 
 def _save_integration_creds(tenant_dir: Path, slug: str, creds: dict) -> None:
@@ -595,13 +632,21 @@ once.
        (kind, subject) is superseded; markdown body also mirrors to disk
        under tenants/<slug>/reports/<kind>/.
   - `[[COO_APP_ACTION slug=<integration> action=<name> args='{...}']]`
-       — take an action in an enabled integration (e.g., HubSpot create_note).
-       The bridge validates that:
-         (1) the integration is connected for this tenant,
-         (2) the action is whitelisted in the integration's manifest,
-         (3) the most recent message asserter is in the integration's
-             scoped team, OR is the CEO, OR is a developer.
-       Result lands as a [[BRIDGE_APP_ACTION_RESULT]] notice.
+       — take an action in a plugin-mode integration (e.g., HubSpot create_note).
+       Scope-checked against the integration's scoped team. Result lands as
+       a `[[BRIDGE_APP_ACTION_RESULT]]` notice.
+  - `[[COO_HTTP_CALL slug=<integration> method=GET|POST|... path=/foo body='{...}']]`
+       — make a call against an http-mode integration. The path is validated
+       against the integration's whitelist; scope-checked against its team.
+       Result lands as a `[[BRIDGE_HTTP_RESULT status=N]]` notice.
+  - For mcp-mode integrations, the agent uses MCP tools natively (no marker
+    needed). For manual-mode integrations, there's no automated access —
+    the app is recorded as a fact but the agent cannot reach it.
+
+When you learn the company uses an app during an interview, emit
+`[[COO_FACT subject="<team-slug>" predicate="uses_tool" object="<app name>"]]`.
+The operator runs `coo tenant tools <slug>` to see all mentioned apps + their
+current connection status, then connects them as appropriate.
   - `[[COO_HOLD]]` — park the thread without action
   - `NOOP` — valid full reply when there is nothing to do
 
@@ -1471,6 +1516,13 @@ class COOBot(discord.Client):
             args_json = m.group(3) or ""
             asyncio.create_task(self._handle_app_action(slug, action, args_json))
 
+        for m in COO_HTTP_CALL_RE.finditer(response):
+            asyncio.create_task(
+                self._handle_http_call(
+                    m.group(1), m.group(2), m.group(3), m.group(4) or "",
+                )
+            )
+
         if (fact_count or commit_count or decision_count
                 or workflow_count or task_count or report_count):
             logger.info(
@@ -1776,6 +1828,11 @@ class COOBot(discord.Client):
         connected = self._enabled_integrations()
         now = time.time()
         for ig in connected:
+            # Only plugin-mode integrations have a sync loop. mcp = Claude
+            # handles it natively, http = on-demand via [[COO_HTTP_CALL]],
+            # manual = no automation.
+            if ig.get("mode") != "plugin":
+                continue
             slug = ig["integration_slug"]
             mani = _load_integration_manifest(slug)
             if mani is None:
@@ -1814,7 +1871,7 @@ class COOBot(discord.Client):
             if not t:
                 return []
             rows = pconn.execute(
-                "SELECT integration_slug, scoped_team_slug, status "
+                "SELECT integration_slug, mode, scoped_team_slug, status, config_json "
                 "FROM tenant_apps WHERE tenant_id = ? AND status = 'connected'",
                 (t["id"],),
             ).fetchall()
@@ -1873,6 +1930,78 @@ class COOBot(discord.Client):
                 return True
             return False
         return False
+
+    async def _handle_http_call(
+        self, slug: str, method: str, path: str, body: str
+    ) -> None:
+        """Dispatch a [[COO_HTTP_CALL]] through the generic HTTP integration mode."""
+        if not self._integration_scope_ok(slug):
+            await self._send_to_agent(
+                f"[[BRIDGE_HTTP_DENIED slug={slug} path={path}]]\n\n"
+                "Refused: asserter is outside the integration's scoped team.",
+                cancel_first=False,
+            )
+            return
+        pconn = _connect(self.cfg.platform_db)
+        try:
+            t = pconn.execute(
+                "SELECT id FROM tenants WHERE slug = ?", (self.cfg.tenant_slug,)
+            ).fetchone()
+            row = pconn.execute(
+                "SELECT mode, config_json FROM tenant_apps "
+                "WHERE tenant_id = ? AND integration_slug = ? AND status = 'connected'",
+                (t["id"], slug),
+            ).fetchone()
+        finally:
+            pconn.close()
+        if not row or row["mode"] != "http":
+            await self._send_to_agent(
+                f"[[BRIDGE_HTTP_DENIED slug={slug} path={path}]]\n\n"
+                "Refused: integration is not in 'http' mode (or not connected).",
+                cancel_first=False,
+            )
+            return
+        config = json.loads(row["config_json"] or "{}")
+        # Whitelist check: action pattern is "METHOD:path".
+        actions = config.get("actions", [])
+        wanted = f"{method}:{path}"
+        if actions and not any(_match_action(wanted, a) for a in actions):
+            await self._send_to_agent(
+                f"[[BRIDGE_HTTP_DENIED slug={slug} action={wanted}]]\n\n"
+                "Refused: pattern not in this integration's whitelist.",
+                cancel_first=False,
+            )
+            return
+        creds = _load_integration_creds(self._tenant_dir, slug) or {}
+        try:
+            result = await asyncio.to_thread(
+                _http_call,
+                config.get("base_url", ""), method, path, body,
+                config.get("auth_scheme", "bearer"),
+                config.get("header_name") or "",
+                creds.get("token", ""),
+            )
+            await asyncio.to_thread(
+                self._audit_integration, slug, "integration_http_ok",
+                {"method": method, "path": path, "status_code": result["status"]},
+            )
+            preview = (result["body"] or "")[:600]
+            await self._send_to_agent(
+                f"[[BRIDGE_HTTP_RESULT slug={slug} status={result['status']}]]\n\n"
+                f"Response preview:\n{preview}",
+                cancel_first=False,
+            )
+        except Exception as e:
+            logger.exception("http call %s %s %s failed", slug, method, path)
+            await asyncio.to_thread(
+                self._audit_integration, slug, "integration_http_failed",
+                {"method": method, "path": path, "error": str(e)},
+            )
+            await self._send_to_agent(
+                f"[[BRIDGE_HTTP_FAILED slug={slug} path={path}]]\n\n"
+                f"Error: {e}",
+                cancel_first=False,
+            )
 
     async def _handle_app_action(self, slug: str, action: str, args_json: str) -> None:
         if not self._integration_scope_ok(slug):

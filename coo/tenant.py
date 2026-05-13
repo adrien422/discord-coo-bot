@@ -1125,6 +1125,66 @@ def summary_cmd(slug: str):
         conn.close()
 
 
+@tenant_cmd.command(name="tools")
+@click.argument("slug")
+def tools_cmd(slug: str):
+    """List apps the company mentioned (via 'uses_tool' facts) with connect status.
+
+    The agent records `[[COO_FACT subject="<team>" predicate="uses_tool" object="<app>"]]`
+    during interviews. This surfaces them so the operator can decide which to
+    wire up via `coo integration connect` and which mode to use.
+    """
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    pconn = connect(platform_db_path())
+    connected = {
+        r["integration_slug"]: dict(r)
+        for r in pconn.execute(
+            "SELECT integration_slug, mode, scoped_team_slug, status "
+            "FROM tenant_apps WHERE tenant_id = ? AND status = 'connected'",
+            (tenant["id"],),
+        ).fetchall()
+    }
+    pconn.close()
+    tconn = connect(tenant_db)
+    rows = tconn.execute(
+        "SELECT f.object_text AS app, "
+        "       COALESCE(t.slug, 'company') AS team_slug, "
+        "       f.asserted_at "
+        "FROM facts f "
+        "LEFT JOIN teams t ON (f.subject_kind = 'team' AND t.id = f.subject_id) "
+        "WHERE f.is_current = 1 AND f.predicate = 'uses_tool' "
+        "ORDER BY team_slug, f.object_text"
+    ).fetchall()
+    tconn.close()
+    if not rows:
+        click.echo("No apps recorded yet. The agent populates these via "
+                   "`[[COO_FACT predicate=\"uses_tool\"]]` markers during interviews.")
+        return
+    # Group by team
+    by_team: dict[str, list] = {}
+    for r in rows:
+        by_team.setdefault(r["team_slug"], []).append(r)
+    for team_slug, items in by_team.items():
+        click.echo(f"\n{team_slug}:")
+        for r in items:
+            app = r["app"].strip().lower()
+            slug_match = next(
+                (k for k in connected if k.lower() == app or app in k.lower()),
+                None,
+            )
+            if slug_match:
+                info = connected[slug_match]
+                status = (
+                    f"[{info['mode']:<6} team={info['scoped_team_slug']}]  "
+                    f"connected as `{slug_match}`"
+                )
+            else:
+                status = "[none  ]  not yet connected"
+            click.echo(f"  - {r['app']:<20}  {status}")
+
+
 @tenant_cmd.command(name="workflows")
 @click.argument("slug")
 def workflows_cmd(slug: str):
