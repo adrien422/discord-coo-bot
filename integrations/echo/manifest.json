@@ -1,0 +1,9 @@
+{
+  "slug": "echo",
+  "name": "Echo (test integration)",
+  "version": "1",
+  "description": "Synthesises fake data each sync. Used to validate the integration framework without needing real OAuth.",
+  "needs_oauth": false,
+  "sync_cadence_seconds": 60,
+  "actions": ["bounce"]
+}
