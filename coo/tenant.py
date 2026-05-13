@@ -1125,6 +1125,101 @@ def summary_cmd(slug: str):
         conn.close()
 
 
+@tenant_cmd.command(name="workflows")
+@click.argument("slug")
+def workflows_cmd(slug: str):
+    """List workflows recorded for the tenant."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    conn = connect(tenant_db)
+    rows = conn.execute(
+        "SELECT w.slug, w.name, w.description, w.cadence, "
+        "       t.slug AS team_slug, p.display_name AS owner_name "
+        "FROM workflows w "
+        "LEFT JOIN teams t ON t.id = w.owner_team_id "
+        "LEFT JOIN people p ON p.id = w.owner_person_id "
+        "WHERE w.deleted_at IS NULL ORDER BY w.slug"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        click.echo("No workflows recorded.")
+        return
+    for r in rows:
+        owner = r["team_slug"] or r["owner_name"] or "—"
+        cadence = f"  ({r['cadence']})" if r["cadence"] else ""
+        click.echo(f"  {r['slug']:<22} owner={owner}{cadence}")
+        if r["description"]:
+            click.echo(f"    {r['description']}")
+
+
+@tenant_cmd.command(name="tasks")
+@click.argument("slug")
+@click.option("--status", help="Filter by status.")
+@click.option("--limit", default=25, type=int)
+def tasks_cmd(slug: str, status: str | None, limit: int):
+    """List tasks for the tenant."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    conn = connect(tenant_db)
+    q = (
+        "SELECT t.id, t.title, t.status, t.due_at, "
+        "       p.display_name AS owner_name, tm.slug AS team_slug "
+        "FROM tasks t "
+        "LEFT JOIN people p ON p.id = t.owner_person_id "
+        "LEFT JOIN teams tm ON tm.id = t.owner_team_id"
+    )
+    args: list = []
+    if status:
+        q += " WHERE t.status = ?"
+        args.append(status)
+    q += " ORDER BY t.due_at IS NULL, t.due_at ASC, t.id DESC LIMIT ?"
+    args.append(limit)
+    rows = conn.execute(q, args).fetchall()
+    conn.close()
+    if not rows:
+        click.echo("No tasks recorded.")
+        return
+    for r in rows:
+        owner = r["owner_name"] or r["team_slug"] or "—"
+        due = f"  due {r['due_at']}" if r["due_at"] else ""
+        click.echo(f"  #{r['id']:<4} [{r['status']:<9}] {r['title']}  ({owner}){due}")
+
+
+@tenant_cmd.command(name="reports")
+@click.argument("slug")
+@click.option("--kind", help="Filter by report_kind.")
+def reports_cmd(slug: str, kind: str | None):
+    """List current reports / factsheets recorded for the tenant."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    conn = connect(tenant_db)
+    q = (
+        "SELECT id, report_kind, subject_kind, subject_id, title, "
+        "       file_path, generated_at "
+        "FROM reports WHERE is_current = 1"
+    )
+    args: list = []
+    if kind:
+        q += " AND report_kind = ?"
+        args.append(kind)
+    q += " ORDER BY generated_at DESC"
+    rows = conn.execute(q, args).fetchall()
+    conn.close()
+    if not rows:
+        click.echo("No current reports.")
+        return
+    for r in rows:
+        subj = f"{r['subject_kind']}:{r['subject_id']}" if r["subject_kind"] else "—"
+        click.echo(
+            f"  #{r['id']:<4} [{r['report_kind']:<20}] {r['title']}  "
+            f"subj={subj}  @ {r['generated_at']}\n"
+            f"    {r['file_path']}"
+        )
+
+
 @tenant_cmd.command(name="inbox")
 @click.argument("slug")
 @click.option("--state", help="Filter by workflow_state (pending|queued|held|attended|...).")

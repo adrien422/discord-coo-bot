@@ -59,12 +59,21 @@ COO_COMMITMENT_RE = re.compile(
     r'\[\[COO_COMMITMENT\s+person_id=(\d+)\s+description="([^"]+)"(?:\s+due="([^"]+)")?\]\]'
 )
 COO_DECISION_RE = re.compile(r"\[\[COO_DECISION\s+(.+?)\]\]", re.S)
-_KV_RE = re.compile(r'(\w+)="([^"]*)"')
+# Accept either key="quoted value" or key=bare_token (no whitespace, no `]`).
+_KV_RE = re.compile(r'(\w+)=(?:"([^"]*)"|([^\s\]]+))')
+
+
+def _parse_kv(inner: str) -> dict[str, str]:
+    """key=value pairs from a marker's inner text. Tolerates quoted + bare values."""
+    out: dict[str, str] = {}
+    for m in _KV_RE.finditer(inner):
+        out[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
+    return out
 
 
 def _parse_decision_fields(inner: str) -> tuple[str, str, str | None, str | None]:
     """Tolerate Claude's variants on field names."""
-    fields = dict(_KV_RE.findall(inner))
+    fields = _parse_kv(inner)
     title = fields.get("title") or fields.get("subject") or ""
     body = (
         fields.get("text")
@@ -83,6 +92,11 @@ COO_INBOX_HANDLE_RE = re.compile(
 COO_QUERY_APP_RE = re.compile(r"\[\[COO_QUERY_APP\s+slug=(\w+)\s+query=([^\]]+)\]\]")
 COO_APP_ACTION_RE = re.compile(
     r"\[\[COO_APP_ACTION\s+slug=(\w+)\s+action=(\w+)(?:\s+args='([^']*)')?\]\]"
+)
+COO_WORKFLOW_RE = re.compile(r"\[\[COO_WORKFLOW\s+(.+?)\]\]")
+COO_TASK_RE = re.compile(r"\[\[COO_TASK\s+(.+?)\]\]")
+COO_REPORT_RE = re.compile(
+    r"\[\[COO_REPORT\s+(.+?)\]\](.*?)\[\[/COO_REPORT\]\]", re.S
 )
 PHASE_APPROVAL_RE = re.compile(r"\bapprove\s+phase\s+([2-9])\b", re.I)
 
@@ -566,6 +580,20 @@ once.
   - `[[COO_INBOX_HANDLE id=N state=attended|held|no-action|queued note="<short>"]]`
        — triage an inbox item (DM from a non-allowlisted user). The daily
        brief surfaces pending inbox items; you decide what to do with each.
+  - `[[COO_WORKFLOW slug="<slug>" name="<name>" description="<text>"
+        owner_team="<team-slug>" owner_person_id=<uid> cadence="<text>"]]`
+       — record (or update) a workflow. Upsert by slug.
+  - `[[COO_TASK title="<text>" description="<text>" owner_person_id=<uid>
+        owner_team="<team-slug>" status="pending|active|blocked|done|dropped"
+        due="YYYY-MM-DD"]]`
+       — record a task. 300s freshness dedup on title.
+  - `[[COO_REPORT kind=factsheet-person|factsheet-team|weekly|monthly|org-chart|priorities
+        subject="<id|company|team-slug>" title="<text>"]]
+       <markdown body>
+       [[/COO_REPORT]]`
+       — write a factsheet/report. Previous current report for same
+       (kind, subject) is superseded; markdown body also mirrors to disk
+       under tenants/<slug>/reports/<kind>/.
   - `[[COO_APP_ACTION slug=<integration> action=<name> args='{...}']]`
        — take an action in an enabled integration (e.g., HubSpot create_note).
        The bridge validates that:
@@ -937,6 +965,175 @@ class COOBot(discord.Client):
         finally:
             conn.close()
 
+    def _record_workflow(self, fields: dict, interview_id: int | None) -> None:
+        slug = fields.get("slug")
+        name = fields.get("name") or slug
+        if not slug:
+            return
+        owner_team_id = None
+        owner_person_id = None
+        if (team_slug := fields.get("owner_team")):
+            conn = _connect(self.cfg.tenant_db)
+            try:
+                row = conn.execute(
+                    "SELECT id FROM teams WHERE slug = ?", (team_slug,)
+                ).fetchone()
+                owner_team_id = row["id"] if row else None
+            finally:
+                conn.close()
+        if (owner_uid := fields.get("owner_person_id")):
+            owner_person_id = self._person_id_for_uid(int(owner_uid))
+
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            with conn:
+                existing = conn.execute(
+                    "SELECT id FROM workflows WHERE slug = ?", (slug,)
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        "UPDATE workflows SET name = ?, description = ?, "
+                        "  owner_team_id = COALESCE(?, owner_team_id), "
+                        "  owner_person_id = COALESCE(?, owner_person_id), "
+                        "  cadence = COALESCE(?, cadence), "
+                        "  updated_at = datetime('now') "
+                        "WHERE id = ?",
+                        (
+                            name, fields.get("description"),
+                            owner_team_id, owner_person_id,
+                            fields.get("cadence"),
+                            existing["id"],
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO workflows (slug, name, description, "
+                        "  owner_team_id, owner_person_id, cadence, "
+                        "  source_interview_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            slug, name, fields.get("description"),
+                            owner_team_id, owner_person_id,
+                            fields.get("cadence"), interview_id,
+                        ),
+                    )
+            logger.info("workflow recorded: %s", slug)
+        except Exception:
+            logger.exception("record_workflow failed")
+        finally:
+            conn.close()
+
+    def _record_task(self, fields: dict, interview_id: int | None) -> None:
+        title = fields.get("title")
+        if not title:
+            return
+        owner_person_id = None
+        owner_team_id = None
+        if (owner_uid := fields.get("owner_person_id")):
+            owner_person_id = self._person_id_for_uid(int(owner_uid))
+        if (team_slug := fields.get("owner_team")):
+            conn = _connect(self.cfg.tenant_db)
+            try:
+                row = conn.execute(
+                    "SELECT id FROM teams WHERE slug = ?", (team_slug,)
+                ).fetchone()
+                owner_team_id = row["id"] if row else None
+            finally:
+                conn.close()
+        status = fields.get("status") or "pending"
+        if status not in ("pending", "active", "blocked", "done", "dropped"):
+            status = "pending"
+
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            with conn:
+                recent = conn.execute(
+                    "SELECT id FROM tasks WHERE title = ? "
+                    "AND created_at > datetime('now', '-300 seconds')",
+                    (title,),
+                ).fetchone()
+                if recent:
+                    return
+                conn.execute(
+                    "INSERT INTO tasks (title, description, owner_person_id, "
+                    "  owner_team_id, status, due_at, source_interview_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        title, fields.get("description"), owner_person_id,
+                        owner_team_id, status, fields.get("due"),
+                        interview_id,
+                    ),
+                )
+            logger.info("task recorded: %s", title[:60])
+        except Exception:
+            logger.exception("record_task failed")
+        finally:
+            conn.close()
+
+    def _record_report(
+        self,
+        fields: dict,
+        body_md: str,
+        interview_id: int | None,
+    ) -> None:
+        kind = fields.get("kind") or "factsheet-person"
+        allowed = ("factsheet-person", "factsheet-team", "weekly",
+                   "monthly", "org-chart", "priorities")
+        if kind not in allowed:
+            kind = "factsheet-person"
+        title = fields.get("title")
+        subject = fields.get("subject")
+        subject_kind: str | None = None
+        subject_id: int | None = None
+        if subject:
+            sk, sid = self._resolve_subject(subject)
+            subject_kind, subject_id = sk, sid
+
+        # Mirror to disk under tenants/<slug>/reports/<kind>/<slug-or-subject>.md
+        slug_part = "company"
+        if subject_kind == "person" and subject_id:
+            slug_part = f"person-{subject_id}"
+        elif subject_kind == "team" and subject_id:
+            slug_part = f"team-{subject_id}"
+        file_path = (
+            self._tenant_dir / "reports" / kind / f"{slug_part}.md"
+        )
+        try:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(body_md.strip() + "\n", encoding="utf-8")
+        except Exception:
+            logger.exception("failed to mirror report to disk")
+
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            with conn:
+                # Supersede previous current report for the same (kind, subject)
+                conn.execute(
+                    "UPDATE reports SET is_current = 0 "
+                    "WHERE report_kind = ? "
+                    "  AND COALESCE(subject_kind, '') = COALESCE(?, '') "
+                    "  AND COALESCE(subject_id, 0) = COALESCE(?, 0)",
+                    (kind, subject_kind, subject_id),
+                )
+                conn.execute(
+                    "INSERT INTO reports (report_kind, subject_kind, subject_id, "
+                    "  title, content_md, file_path, generated_by_interview_id, "
+                    "  is_current) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                    (
+                        kind, subject_kind, subject_id, title or kind,
+                        body_md.strip(), str(file_path), interview_id,
+                    ),
+                )
+            logger.info(
+                "report recorded: kind=%s subject=%s:%s file=%s",
+                kind, subject_kind, subject_id, file_path,
+            )
+        except Exception:
+            logger.exception("record_report failed")
+        finally:
+            conn.close()
+
     def _handle_inbox_item(self, item_id: int, new_state: str, note: str | None) -> None:
         conn = _connect(self.cfg.tenant_db)
         try:
@@ -1234,6 +1431,28 @@ class COOBot(discord.Client):
             )
             decision_count += 1
 
+        workflow_count = 0
+        for m in COO_WORKFLOW_RE.finditer(response):
+            fields = _parse_kv(m.group(1))
+            await asyncio.to_thread(self._record_workflow, fields, active_iid)
+            workflow_count += 1
+
+        task_count = 0
+        for m in COO_TASK_RE.finditer(response):
+            fields = _parse_kv(m.group(1))
+            await asyncio.to_thread(self._record_task, fields, active_iid)
+            task_count += 1
+
+        report_count = 0
+        for m in COO_REPORT_RE.finditer(response):
+            fields = _parse_kv(m.group(1))
+            body_md = m.group(2) or ""
+            if body_md.strip():
+                await asyncio.to_thread(
+                    self._record_report, fields, body_md, active_iid
+                )
+                report_count += 1
+
         for m in COO_CLOSE_USER_RE.finditer(response):
             uid = int(m.group(1))
             pid = await asyncio.to_thread(self._person_id_for_uid, uid)
@@ -1252,10 +1471,13 @@ class COOBot(discord.Client):
             args_json = m.group(3) or ""
             asyncio.create_task(self._handle_app_action(slug, action, args_json))
 
-        if fact_count or commit_count or decision_count:
+        if (fact_count or commit_count or decision_count
+                or workflow_count or task_count or report_count):
             logger.info(
-                "persisted markers: facts=%d commitments=%d decisions=%d",
+                "persisted markers: facts=%d commitments=%d decisions=%d "
+                "workflows=%d tasks=%d reports=%d",
                 fact_count, commit_count, decision_count,
+                workflow_count, task_count, report_count,
             )
 
         for m in COO_NEXT_CONTACT_RE.finditer(response):
