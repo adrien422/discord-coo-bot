@@ -2,7 +2,30 @@
 
 Multi-tenant COO agent platform. One installation runs on a VM and hosts one or more isolated *tenants* — each tenant being a company that the agent serves. The system is operated by two platform developers (Dan Core, Adrien Kelly) who handle bootstrap, schema migrations, and integration enablement; each tenant has its own CEO/owner who is the content authority for that tenant.
 
-This document captures the design. The repo also contains a legacy single-tenant Discord bridge (`discord_coo_bot.py` and surrounding files) that predates this design and will be progressively replaced.
+> **Status**: this document captures the original design. Most of it is now built — the Phase 1 listener, persistence, cadences, integrations framework, cockpit, memory isolation, phase-unlock handshake. See [README.md](README.md) for the actual command surface and [ROADMAP.md](ROADMAP.md) for what was built when.
+
+This document captures the design. The repo also contains a legacy single-tenant Discord bridge (`discord_coo_bot.py` and surrounding files) that predates this design and is preserved for reference (no longer used by the new platform).
+
+## What's shipped vs designed
+
+Implemented end-to-end:
+
+- Two-layer architecture: `coo platform install` (one per VM) + `coo tenant new` (one per company), platform + tenant DBs separated.
+- Per-tenant Claude memory isolation via `CLAUDE_CONFIG_DIR` with shared auth (selective symlinks for `.credentials.json`, `settings.json`, `plugins`, `skills`, `statsig`; per-tenant `projects/`).
+- Phase 1 Discord listener (`messaging/discord/plugin/coo_phase1.py`) — agent-initiated DMs, allowlist enforcement, inbox routing, bidirectional bridge to Claude via tmux.
+- Markers: `[[COO_TO]]`, `[[COO_FIND_MEMBER]]`, `[[COO_NEXT_CONTACT]]`, `[[COO_CLOSE user_id=N]]`, `[[COO_FACT]]`, `[[COO_COMMITMENT]]`, `[[COO_DECISION]]`, `[[COO_WORKFLOW]]`, `[[COO_TASK]]`, `[[COO_REPORT]]`, `[[COO_INBOX_HANDLE]]`, `[[COO_APP_ACTION]]`.
+- Operating cadences: `scheduled_contacts` firing + `cadences` (daily-brief / weekly-pulse / monthly-review / quarterly-okr-grade / factsheet-refresh / risk-review) with cron-driven `next_fire_at`.
+- Phase-unlock keyword handshake — developer DM containing "approve phase N" bumps `tenants.phase` and sends Claude a `[[BRIDGE_PHASE_UNLOCKED]]` notice.
+- App integration framework — `integrations/<slug>/{manifest.json, schema.sql, plugin/}`, per-tenant OAuth state, sync loop in the bot, action whitelist + team-scoped enforcement. Two integrations ship: `echo` (test) and `hubspot` (real).
+- Discord cockpit `/coo` slash commands: status, facts, commitments, decisions, cadences, inbox.
+- Operator CLI: `coo platform | developer | tenant | integration` covering install, tenant lifecycle, allowlist widening, cadence visibility, manual cadence firing, metrics, risks, OKRs, workflows, tasks, reports, inbox, tenant summary.
+
+Designed but not yet built:
+
+- Google Chat listener plugin (Discord works; Chat schema column exists but no listener).
+- SSH-tunnel OAuth callback automation (currently operator pastes the auth code instead).
+- Multi-tenant lifecycle commands like `coo tenant archive`, `coo platform upgrade --pin <tenant>`.
+- `coo tenant migrate` for schema rollouts beyond the wizard.
 
 ## Two-layer architecture
 
