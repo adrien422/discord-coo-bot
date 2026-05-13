@@ -45,6 +45,7 @@ def _systemd_unit_template(repo_root_path: Path) -> str:
 Description=COO agent listener — tenant %i
 After=network-online.target
 Wants=network-online.target
+OnFailure=coo-failure-notify@%i.service
 
 [Service]
 Type=simple
@@ -65,14 +66,42 @@ WantedBy=default.target
 """
 
 
+def _systemd_alert_template() -> str:
+    """Oneshot unit that gets triggered by OnFailure on the main unit.
+
+    Appends a failure record to a platform-level failures log that the
+    operator (or platform health command) can inspect. v1 keeps the
+    notification local; replace this script with a webhook / email
+    sender in production.
+    """
+    return """\
+[Unit]
+Description=Record COO tenant %i failure to the platform failures log
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'mkdir -p %h/.local/share/coo/platform && \
+  printf "%%s tenant=%i failed (see journalctl --user -u coo-tenant@%i)\\n" \
+  "$(date -Iseconds)" >> %h/.local/share/coo/platform/tenant-failures.log'
+"""
+
+
 def _ensure_systemd_unit() -> Path:
-    """Install the template unit once. Idempotent."""
+    """Install the template units. Idempotent."""
     unit_dir = _systemd_user_dir()
     unit_dir.mkdir(parents=True, exist_ok=True)
     unit_path = unit_dir / "coo-tenant@.service"
-    expected = _systemd_unit_template(repo_root())
-    if not unit_path.exists() or unit_path.read_text() != expected:
-        unit_path.write_text(expected)
+    alert_path = unit_dir / "coo-failure-notify@.service"
+    changed = False
+    expected_unit = _systemd_unit_template(repo_root())
+    if not unit_path.exists() or unit_path.read_text() != expected_unit:
+        unit_path.write_text(expected_unit)
+        changed = True
+    expected_alert = _systemd_alert_template()
+    if not alert_path.exists() or alert_path.read_text() != expected_alert:
+        alert_path.write_text(expected_alert)
+        changed = True
+    if changed:
         subprocess.run(
             ["systemctl", "--user", "daemon-reload"],
             check=False, capture_output=True,
@@ -1433,6 +1462,161 @@ def inbox_cmd(slug: str, state: str | None, limit: int):
             f"  #{r['id']:<4} [{r['workflow_state']:<9}] {r['received_at']}  "
             f"{r['sender']}: {r['preview']}"
         )
+
+
+@tenant_cmd.command(name="health")
+@click.argument("slug")
+def health_cmd(slug: str):
+    """Comprehensive health check for a tenant — runtime, DB, recent activity."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tdir = Path(tenant["tenant_dir"])
+    tenant_db = tdir / "db" / "coo.db"
+
+    issues: list[str] = []
+    healthy: list[str] = []
+
+    def ok(msg: str):
+        healthy.append(msg)
+        click.echo(f"  [{click.style('OK   ', fg='green')}] {msg}")
+
+    def warn(msg: str):
+        issues.append(msg)
+        click.echo(f"  [{click.style('WARN ', fg='yellow')}] {msg}")
+
+    def fail(msg: str):
+        issues.append(msg)
+        click.echo(f"  [{click.style('FAIL ', fg='red')}] {msg}")
+
+    click.echo(click.style(f"\n  Health: {slug} ({tenant['company_name']})\n", bold=True))
+
+    # --- Runtime ---
+    unit = _systemd_unit_name(slug)
+    sd_runtime = None
+    if _systemd_available():
+        r = _systemctl_user("is-active", unit)
+        state = r.stdout.strip()
+        sd_runtime = state
+        if state == "active":
+            show = _systemctl_user(
+                "show", unit, "--property=MainPID,SubState,ActiveEnterTimestamp",
+            )
+            ok(f"systemd unit active: {show.stdout.strip().replace(chr(10), '  ')}")
+        elif state == "failed":
+            fail(f"systemd unit FAILED")
+        elif state == "inactive":
+            # Could be intentional (stop), or could be a crash
+            if tenant["status"] == "running":
+                fail("tenants.status='running' but systemd unit inactive — crashed?")
+            else:
+                warn(f"systemd unit inactive (tenants.status={tenant['status']})")
+    pid_file = tdir / "state" / "bot.pid"
+    if pid_file.exists() and sd_runtime != "active":
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+            ok(f"subprocess bot alive (pid {pid})")
+        except (OSError, ValueError):
+            warn(f"stale PID file at {pid_file}")
+
+    # --- DB integrity ---
+    if not tenant_db.exists():
+        fail(f"tenant DB missing: {tenant_db}")
+    else:
+        try:
+            conn = connect(tenant_db)
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+            if row[0] == "ok":
+                ok("DB integrity check passed")
+            else:
+                fail(f"DB integrity: {row[0]}")
+            # WAL hygiene
+            wal = tenant_db.parent / f"{tenant_db.name}-wal"
+            if wal.exists() and wal.stat().st_size > 50 * 1024 * 1024:
+                warn(f"WAL file is large ({wal.stat().st_size // (1024*1024)} MiB) — consider WAL checkpoint")
+            conn.close()
+        except Exception as e:
+            fail(f"DB error: {e}")
+
+    # --- Recent activity ---
+    conn = connect(tenant_db) if tenant_db.exists() else None
+    if conn is not None:
+        try:
+            # Most recent fact
+            last_fact = conn.execute(
+                "SELECT MAX(created_at) AS t FROM facts"
+            ).fetchone()["t"]
+            if last_fact:
+                ok(f"last fact recorded: {last_fact}")
+            else:
+                warn("no facts recorded yet")
+            # Pending nudges
+            pending = conn.execute(
+                "SELECT COUNT(*) AS n FROM scheduled_contacts WHERE status='pending'"
+            ).fetchone()["n"]
+            ok(f"pending nudges: {pending}")
+            # Cadence health: any cadence past its next_fire_at by >5 min?
+            stale = conn.execute(
+                "SELECT slug, next_fire_at FROM cadences "
+                "WHERE is_active = 1 AND next_fire_at IS NOT NULL "
+                "  AND next_fire_at < datetime('now', '-300 seconds')"
+            ).fetchall()
+            if stale:
+                fail(
+                    "stale cadences (overdue >5 min): "
+                    + ", ".join(f"{r['slug']}@{r['next_fire_at']}" for r in stale)
+                )
+            else:
+                ok("no stale cadences")
+            # Last cadence run
+            last_run = conn.execute(
+                "SELECT MAX(started_at) AS t FROM cadence_runs"
+            ).fetchone()["t"]
+            if last_run:
+                ok(f"last cadence run: {last_run}")
+            # Inbox backlog
+            backlog = conn.execute(
+                "SELECT COUNT(*) AS n FROM inbox_items WHERE workflow_state='pending'"
+            ).fetchone()["n"]
+            if backlog > 0:
+                warn(f"inbox backlog: {backlog} pending item(s)")
+            else:
+                ok("inbox clean")
+        finally:
+            conn.close()
+
+    # --- Log tail (bot.log) ---
+    log_file = tdir / "state" / "bot.log"
+    if log_file.exists():
+        size = log_file.stat().st_size
+        ok(f"bot.log present ({size:,} bytes)")
+        if size > 0:
+            click.echo("\n  Recent log tail:")
+            tail = log_file.read_text(errors="replace").splitlines()[-5:]
+            for line in tail:
+                click.echo(f"    {line}")
+    else:
+        warn("bot.log missing")
+
+    # --- Disk / state checks ---
+    secrets = tdir / "messaging" / "secrets.env"
+    if secrets.exists() and oct(secrets.stat().st_mode)[-3:] == "600":
+        ok("secrets.env mode 0600")
+    elif secrets.exists():
+        warn(f"secrets.env mode {oct(secrets.stat().st_mode)[-3:]} (expected 600)")
+    else:
+        fail("secrets.env missing")
+
+    # --- Summary ---
+    click.echo("")
+    if issues:
+        click.echo(click.style(
+            f"  ⚠ {len(issues)} issue(s), {len(healthy)} OK", fg="yellow", bold=True
+        ))
+        sys.exit(1)
+    click.echo(click.style(
+        f"  ✓ Healthy ({len(healthy)} checks passed)", fg="green", bold=True
+    ))
 
 
 @tenant_cmd.command(name="stop")
