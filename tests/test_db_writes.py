@@ -167,3 +167,21 @@ def test_resolve_subject_variants(cfg_for):
     # person by Discord user_id
     kind, sid = mb._resolve_subject("999")
     assert kind == "person" and sid == 1
+
+
+def test_load_allowlist_includes_platform_developers(cfg_for):
+    """A platform developer must appear in the allowlist (so the DM gate
+    lets them through even though they're not in the tenant people table)."""
+    import sqlite3
+    m, cfg = cfg_for
+    # Insert a developer into the platform DB
+    pconn = sqlite3.connect(cfg.platform_db)
+    with pconn:
+        pconn.execute(
+            "INSERT INTO developers (handle, display_name, email, discord_user_id) "
+            "VALUES ('dev1', 'Dev One', 'dev@x.com', 555000111)"
+        )
+    pconn.close()
+    al = m.load_allowlist(cfg)
+    assert 555000111 in al
+    assert al[555000111]["tier"] == "developer"

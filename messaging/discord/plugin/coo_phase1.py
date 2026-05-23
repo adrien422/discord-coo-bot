@@ -1694,10 +1694,16 @@ class COOBot(discord.Client):
         sender_id = message.author.id
         content = message.content or ""
 
-        # Gate: only people IN THE ORG CHART get forwarded to the agent.
-        # Out-of-chart DMs → inbox + one polite ack per 24h. Rate-limited.
+        # Reload the role map (includes platform developers + org-chart people).
+        self.allowlist = await asyncio.to_thread(load_allowlist, self.cfg)
+        is_dev = self.allowlist.get(sender_id, {}).get("tier") == "developer"
+
+        # Gate: forward to the agent if the sender is IN THE ORG CHART
+        # (people table) OR is a platform developer. Developers built the
+        # system and must always be able to reach the agent, even though
+        # they aren't part of any tenant's company org chart.
         person_id = await asyncio.to_thread(self._person_id_for_uid, sender_id)
-        if person_id is None:
+        if person_id is None and not is_dev:
             allow_save, send_ack = self._check_inbox_limits(sender_id)
             if not allow_save:
                 logger.warning(
@@ -1727,9 +1733,6 @@ class COOBot(discord.Client):
                     logger.exception("courtesy ack failed for uid=%s", sender_id)
             return
 
-        # Reload the role map so newly-added managers / developers are reflected
-        # without a restart. It's used for role weighting in the relay.
-        self.allowlist = await asyncio.to_thread(load_allowlist, self.cfg)
         sender = self.allowlist.get(sender_id) or {
             "name": message.author.display_name or message.author.name,
             "handle": message.author.name,
@@ -1737,8 +1740,9 @@ class COOBot(discord.Client):
             "tier": "employee",
         }
         logger.info(
-            "DM from %s (uid=%s, role=%s) — in org chart",
+            "DM from %s (uid=%s, role=%s) — %s",
             sender["name"], sender_id, sender.get("role"),
+            "developer" if is_dev else "in org chart",
         )
 
         # Phase-unlock keyword still honoured (developer-only).
@@ -1758,12 +1762,15 @@ class COOBot(discord.Client):
                         cancel_first=False,
                     )
 
-        self._last_asserter_person_id = person_id
-        iid = await asyncio.to_thread(self._ensure_interview, person_id)
-        if iid is not None:
-            await asyncio.to_thread(
-                self._append_transcript, iid, "user", sender["name"], content
-            )
+        # Org-chart people get an interview + transcript. Developers giving
+        # operational instructions don't — they're not being "interviewed".
+        if person_id is not None:
+            self._last_asserter_person_id = person_id
+            iid = await asyncio.to_thread(self._ensure_interview, person_id)
+            if iid is not None:
+                await asyncio.to_thread(
+                    self._append_transcript, iid, "user", sender["name"], content
+                )
 
         prompt = relay_prompt(sender, sender_id, content)
         await self._send_to_agent(prompt, cancel_first=False)
