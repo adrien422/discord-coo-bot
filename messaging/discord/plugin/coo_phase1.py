@@ -945,6 +945,8 @@ class COOBot(discord.Client):
         self.first_start_marker = cfg.state_dir / "first_start_done"
         self._delivered_path = cfg.state_dir / "delivered.json"
         self._last_delivered: dict[int, str] = self._load_delivered()
+        self._inbox_state_path = cfg.state_dir / "inbox_state.json"
+        self._inbox_state: dict[str, dict] = self._load_inbox_state()
         self._send_lock = asyncio.Lock()
         # tenant dir (parent of state_dir) — for placing transcripts on disk
         self._tenant_dir = cfg.state_dir.parent
@@ -967,6 +969,47 @@ class COOBot(discord.Client):
             self._delivered_path.write_text(json.dumps(self._last_delivered))
         except Exception:
             logger.exception("failed to persist delivered.json")
+
+    # --- inbox rate-limit + ack throttling ------------------------------
+
+    INBOX_SAVES_PER_DAY = 20
+    INBOX_ACKS_PER_DAY = 1
+    INBOX_WINDOW_SECONDS = 86400
+
+    def _load_inbox_state(self) -> dict[str, dict]:
+        if not self._inbox_state_path.exists():
+            return {}
+        try:
+            return json.loads(self._inbox_state_path.read_text())
+        except Exception:
+            return {}
+
+    def _save_inbox_state(self) -> None:
+        try:
+            self._inbox_state_path.write_text(json.dumps(self._inbox_state))
+        except Exception:
+            logger.exception("failed to persist inbox_state.json")
+
+    def _check_inbox_limits(self, uid: int) -> tuple[bool, bool]:
+        """Apply per-uid rate-limit + ack-throttle. Returns (allow_save, send_ack)."""
+        now = time.time()
+        cutoff = now - self.INBOX_WINDOW_SECONDS
+        key = str(uid)
+        entry = self._inbox_state.get(key, {"saves_at": [], "acks_at": []})
+        entry["saves_at"] = [t for t in entry.get("saves_at", []) if t > cutoff]
+        entry["acks_at"] = [t for t in entry.get("acks_at", []) if t > cutoff]
+
+        allow_save = len(entry["saves_at"]) < self.INBOX_SAVES_PER_DAY
+        send_ack = len(entry["acks_at"]) < self.INBOX_ACKS_PER_DAY
+
+        if allow_save:
+            entry["saves_at"].append(now)
+        if send_ack:
+            entry["acks_at"].append(now)
+
+        self._inbox_state[key] = entry
+        self._save_inbox_state()
+        return allow_save, send_ack
 
     async def _send_to_agent(self, text: str, cancel_first: bool = False) -> None:
         """Serialised paste into Claude's pane; prevents concurrent paste collisions.
@@ -1574,14 +1617,37 @@ class COOBot(discord.Client):
         sender_id = message.author.id
         content = message.content or ""
 
-        # Gate: only people IN THE ORG CHART (people table, with a Discord ID)
-        # get forwarded to the agent. Anyone else → inbox for later triage.
+        # Gate: only people IN THE ORG CHART get forwarded to the agent.
+        # Out-of-chart DMs → inbox + one polite ack per 24h. Rate-limited.
         person_id = await asyncio.to_thread(self._person_id_for_uid, sender_id)
         if person_id is None:
+            allow_save, send_ack = self._check_inbox_limits(sender_id)
+            if not allow_save:
+                logger.warning(
+                    "inbox rate-limit hit for uid=%s — dropping DM silently",
+                    sender_id,
+                )
+                return
             await asyncio.to_thread(
                 save_inbox_item, self.cfg,
                 message.author, content, message.id, message.channel.id,
             )
+            # Courtesy ack — only for humans, once per 24h per uid.
+            if send_ack and not getattr(message.author, "bot", False):
+                ceo_name = (
+                    self.ceo["display_name"] if self.ceo else "the operator"
+                )
+                ack = (
+                    f"I'm the COO agent for {self.company}. I don't have you "
+                    f"in the org chart yet — {ceo_name} will see this and "
+                    f"decide whether to add you. I'll be in touch once that's "
+                    f"sorted."
+                )
+                try:
+                    await message.author.send(ack)
+                    logger.info("sent courtesy ack to uid=%s", sender_id)
+                except Exception:
+                    logger.exception("courtesy ack failed for uid=%s", sender_id)
             return
 
         # Reload the role map so newly-added managers / developers are reflected
@@ -2465,6 +2531,21 @@ def _register_cockpit(bot: "COOBot") -> None:
         body = await asyncio.to_thread(_cockpit_cadences, bot.cfg)
         await interaction.followup.send(body or "No cadences seeded.", ephemeral=True)
 
+    @group.command(name="whois", description="Look up a Discord user before adding them to the org chart.")
+    @discord.app_commands.describe(user_id="Discord user_id (snowflake)")
+    async def whois_cmd(interaction: discord.Interaction, user_id: str):
+        if not _gate(interaction):
+            await interaction.response.send_message("Not in the allowlist.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            uid = int(user_id)
+        except ValueError:
+            await interaction.followup.send("user_id must be numeric.", ephemeral=True)
+            return
+        body = await asyncio.to_thread(_cockpit_whois, bot, uid)
+        await interaction.followup.send(body, ephemeral=True)
+
     @group.command(name="inbox", description="Pending DMs from people not yet in the org chart.")
     async def inbox_cmd(interaction: discord.Interaction):
         if not _gate(interaction):
@@ -2607,6 +2688,47 @@ def _cockpit_decisions(cfg: Config) -> str:
         body += f"\n   _decided {r['decided_at']}_"
         lines.append(body)
     return "**Recent decisions**\n" + "\n\n".join(lines)
+
+
+def _cockpit_whois(bot, uid: int) -> str:
+    """Inspect a Discord user: org-chart membership + recent inbox activity."""
+    conn = _connect(bot.cfg.tenant_db)
+    try:
+        person = conn.execute(
+            "SELECT slug, display_name, role, access_tier, is_content_approver "
+            "FROM people WHERE discord_user_id = ?", (uid,)
+        ).fetchone()
+        inbox_recent = conn.execute(
+            "SELECT i.id, i.received_at, substr(i.content, 1, 120) AS preview "
+            "FROM inbox_items i JOIN channels c ON c.id = i.channel_id "
+            "WHERE c.name LIKE ? "
+            "ORDER BY i.received_at DESC LIMIT 5",
+            (f"%{uid}%",),
+        ).fetchall()
+    finally:
+        conn.close()
+    parts = [f"**Discord uid `{uid}`**"]
+    if person:
+        parts.append(
+            f"• In org chart: **{person['display_name']}** "
+            f"(slug={person['slug']}, role={person['role'] or '—'}, "
+            f"tier={person['access_tier']}, "
+            f"content_approver={bool(person['is_content_approver'])})"
+        )
+    else:
+        parts.append("• Not in org chart.")
+    if bot.allowlist.get(uid, {}).get("tier") == "developer":
+        parts.append("• Platform developer.")
+    state = bot._inbox_state.get(str(uid), {})
+    saves = len(state.get("saves_at", []))
+    acks = len(state.get("acks_at", []))
+    if saves or acks:
+        parts.append(f"• Last 24h: {saves} inbox save(s), {acks} courtesy ack(s).")
+    if inbox_recent:
+        parts.append("• Recent inbox items:")
+        for r in inbox_recent:
+            parts.append(f"   - #{r['id']} _{r['received_at']}_: {r['preview']}")
+    return "\n".join(parts)
 
 
 def _cockpit_inbox(cfg: Config) -> str:
