@@ -85,6 +85,11 @@ def _parse_decision_fields(inner: str) -> tuple[str, str, str | None, str | None
     scope = fields.get("scope") or None
     return title, body, rationale, scope
 COO_CLOSE_USER_RE = re.compile(r"\[\[COO_CLOSE\s+user_id=(\d+)\]\]")
+COO_INBOX_HANDLE_RE = re.compile(
+    r'\[\[COO_INBOX_HANDLE\s+id=(\d+)\s+state=(attended|held|no-action|queued)'
+    r'(?:\s+note="([^"]*)")?\]\]'
+)
+COO_PERSON_ADD_RE = re.compile(r"\[\[COO_PERSON_ADD\s+(.+?)\]\]")
 COO_QUERY_APP_RE = re.compile(r"\[\[COO_QUERY_APP\s+slug=(\w+)\s+query=([^\]]+)\]\]")
 COO_APP_ACTION_RE = re.compile(
     r"\[\[COO_APP_ACTION\s+slug=(\w+)\s+action=(\w+)(?:\s+args='([^']*)')?\]\]"
@@ -513,40 +518,73 @@ def mission_prompt(cfg: Config, allowlist: dict[int, dict], ceo: dict, company_n
     return f"""You are the persistent COO agent for **{company_name}**.
 
 Your conversation surface is Discord (this session is bridged to it via tmux).
-The listener forwards EVERY DM the bot receives to you and relays anything
-you emit between [[…]] markers back to the recipient.
+The listener forwards DMs from people IN THE ORG CHART (the `people` table)
+to you, and relays anything you emit between [[…]] markers back to the
+recipient.
 
 # Who you talk to
 
-Anyone in the company server can DM you. There is no allowlist — every
-inbound DM lands here. The bridge tags each DM with the sender's role
-(developer / CEO / manager / employee) so you can weight your responses.
+Anyone in the company's org chart can DM you. The org chart is the
+`people` table — every person who has been deliberately added is in
+scope. The Discord server may contain extras (vendors, bots, guests,
+friends-of-CEO) — they are NOT automatically in the org chart and
+their DMs are saved to an inbox, not surfaced to you in real time.
 
-Key people whose role is pre-recorded:
+Key people pre-recorded for this tenant:
 
   - {ceo['display_name']} (Discord user_id={cfg.ceo_user_id}, role: {ceo.get('role') or 'CEO'}, content authority for {company_name})
 {dev_lines}
 
-Anyone else who DMs you is treated as an employee by default; you can
-update their role via [[COO_FACT]] once you learn it.
-
 How to weight DMs by role:
-  - **developer** (the engineers who built and maintain you): commands carry
+  - **developer** (engineers who built and maintain you): commands carry
     the highest technical weight. They can unlock phases, change scope,
-    pause you. Take their instructions seriously.
+    pause you.
   - **CEO / content_approver**: content authority on the company-map.
     Their answers shape what you record. They can also override most
     operational choices.
   - **manager**: scoped to their team. Their commitments and decisions
     for their team's work are authoritative.
-  - **employee** (the default for unrecognized senders): treat with
-    respect, capture what they say with provenance, but defer to
-    managers / CEO for cross-cutting decisions.
+  - **employee** (default): respect what they say, record with provenance,
+    but defer to managers / CEO for cross-cutting decisions.
 
-You're not a help desk; you're the COO. If an employee DMs you about
-something outside your scope (payroll, HR specifics, vendor disputes),
-acknowledge briefly and route them to the right person rather than
-trying to resolve it yourself.
+# Growing the org chart
+
+To bring a new person into scope, emit:
+
+    [[COO_PERSON_ADD user_id=<discord_uid> name="<display name>"
+        role="<their role>" team="<team-slug>"
+        access_tier="manager|employee|strategic|admin"]]
+
+Use this when:
+  - the CEO names a new manager during Phase 1,
+  - an inbox item is from someone who clearly should be on the team,
+  - a manager mentions a direct report during Phase 2.
+
+Until someone is added, you cannot receive their DMs (they go to inbox)
+but you CAN DM them — `[[COO_TO]]` works for any Discord user the bot
+shares a guild with. So the canonical onboarding flow is:
+
+  1. CEO / manager mentions a person by name.
+  2. You emit [[COO_FIND_MEMBER]] to look them up on Discord.
+  3. Confirm with the CEO that the match is correct.
+  4. Emit [[COO_PERSON_ADD]] to add them to the org chart.
+  5. Emit [[COO_TO user_id=<theirs>]] to introduce yourself.
+  6. From now on their DMs back reach you directly.
+
+# Inbox
+
+If a DM lands from someone NOT in the org chart, the bridge logs it to
+the `inbox_items` table — you do NOT see it in real time. The daily
+brief surfaces pending inbox items so you can triage:
+
+  - If they should be in the org chart, [[COO_PERSON_ADD]] them and
+    follow up.
+  - Otherwise mark with `[[COO_INBOX_HANDLE id=N state=attended|held|
+    no-action note="<reason>"]]`.
+
+You're not a help desk. If someone (in or out of org chart) asks about
+payroll, HR specifics, vendor disputes, route them to the right human
+rather than trying to resolve it yourself.
 
 # Phase 1 — explicit deliverables checklist
 
@@ -729,6 +767,12 @@ After the intro, you never reintroduce yourself. You just operate.
   - `[[COO_DECISION title="<title>" text="<what was decided>" rationale="<why>" scope="<id|company|team-slug>"]]`
        — record a significant decision. rationale and scope are optional.
   - `[[COO_CLOSE user_id=N]]` — mark the interview with that person as closed
+  - `[[COO_PERSON_ADD user_id=N name="<display name>" role="<role>"
+        team="<team-slug>" access_tier="manager|employee|strategic|admin"]]`
+       — add someone to the org chart. Idempotent on user_id. Required
+       before that person can DM you and have it reach the agent.
+  - `[[COO_INBOX_HANDLE id=N state=attended|held|no-action|queued note="<short>"]]`
+       — triage an inbox item (DM from someone not in the org chart).
   - `[[COO_WORKFLOW slug="<slug>" name="<name>" description="<text>"
         owner_team="<team-slug>" owner_person_id=<uid> cadence="<text>"]]`
        — record (or update) a workflow. Upsert by slug.
@@ -833,6 +877,46 @@ def relay_prompt(sender: dict, sender_id: int, text: str) -> str:
 Respond as the persistent COO agent. Use `[[COO_TO user_id=...]]` lines for
 anything you want delivered as a DM. Plain text is internal notes only.
 """
+
+
+# -------------------- inbox (for non-org-chart DMs) --------------------
+
+
+def save_inbox_item(
+    cfg: Config, sender: "discord.User", content: str,
+    message_id: int, channel_id: int,
+) -> None:
+    """Persist a DM from someone not in the org chart for later triage."""
+    tconn = _connect(cfg.tenant_db)
+    try:
+        row = tconn.execute(
+            "SELECT id FROM channels WHERE platform_channel_id = ?",
+            (str(channel_id),),
+        ).fetchone()
+        if row:
+            ch_id = row["id"]
+        else:
+            cur = tconn.execute(
+                "INSERT INTO channels (platform_channel_id, name, kind, is_watched) "
+                "VALUES (?, ?, 'dm', 0)",
+                (str(channel_id), f"DM with {sender.name}"),
+            )
+            ch_id = cur.lastrowid
+        tags = json.dumps([
+            "source-inbox", "channel-dm",
+            f"discord-username-{sender.name}",
+        ])
+        tconn.execute(
+            "INSERT INTO inbox_items (platform_message_id, channel_id, "
+            "  sender_person_id, content, received_at, workflow_state, tags_json) "
+            "VALUES (?, ?, NULL, ?, datetime('now'), 'pending', ?)",
+            (str(message_id), ch_id, content, tags),
+        )
+        tconn.commit()
+        logger.info("inbox: DM from %s (uid=%s) — not in org chart",
+                    sender.name, sender.id)
+    finally:
+        tconn.close()
 
 
 # -------------------- the bot --------------------
@@ -948,23 +1032,42 @@ class COOBot(discord.Client):
         with path.open("a", encoding="utf-8") as f:
             f.write(f"## {ts} — {kind} — {sender}\n\n{text}\n\n")
 
-    def _auto_register_person(
-        self, discord_user_id: int, display_name: str, handle: str
-    ) -> int | None:
-        """Create a people row for a previously-unknown DM sender.
-
-        Tier 'employee', role 'unknown' — the agent can update via [[COO_FACT]]
-        markers as it learns more about them. is_content_approver stays 0.
-        """
-        slug = _slug_for_name(handle or display_name) or f"u{discord_user_id}"
+    def _record_person_add(self, fields: dict) -> int | None:
+        """Add a person to the org chart via [[COO_PERSON_ADD]]. Idempotent."""
+        uid_raw = fields.get("user_id")
+        name = fields.get("name") or fields.get("display_name")
+        if not (uid_raw and name):
+            return None
+        try:
+            uid = int(uid_raw)
+        except ValueError:
+            return None
+        role = fields.get("role")
+        access_tier = fields.get("access_tier") or "employee"
+        if access_tier not in ("admin", "strategic", "manager", "employee"):
+            access_tier = "employee"
+        team_slug = fields.get("team")
+        team_id = None
         conn = _connect(self.cfg.tenant_db)
         try:
+            if team_slug:
+                row = conn.execute(
+                    "SELECT id FROM teams WHERE slug = ?", (team_slug,)
+                ).fetchone()
+                if row:
+                    team_id = row["id"]
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO teams (slug, name) VALUES (?, ?)",
+                        (team_slug, team_slug.replace("-", " ").title()),
+                    )
+                    team_id = cur.lastrowid
             existing = conn.execute(
-                "SELECT id FROM people WHERE discord_user_id = ?", (discord_user_id,)
+                "SELECT id FROM people WHERE discord_user_id = ?", (uid,)
             ).fetchone()
             if existing:
                 return int(existing["id"])
-            # Avoid slug collisions.
+            slug = _slug_for_name(name) or f"u{uid}"
             base = slug
             suffix = 1
             while conn.execute(
@@ -975,16 +1078,17 @@ class COOBot(discord.Client):
             with conn:
                 cur = conn.execute(
                     "INSERT INTO people (slug, display_name, discord_user_id, "
-                    "  access_tier) "
-                    "VALUES (?, ?, ?, 'employee')",
-                    (slug, display_name, discord_user_id),
+                    "  role, team_id, access_tier) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (slug, name, uid, role, team_id, access_tier),
                 )
             logger.info(
-                "auto-registered person uid=%s as slug=%s", discord_user_id, slug
+                "person added: uid=%s slug=%s tier=%s team=%s",
+                uid, slug, access_tier, team_slug or "—",
             )
             return int(cur.lastrowid)
         except Exception:
-            logger.exception("auto_register_person failed for uid=%s", discord_user_id)
+            logger.exception("record_person_add failed for uid=%s", uid_raw)
             return None
         finally:
             conn.close()
@@ -1286,6 +1390,34 @@ class COOBot(discord.Client):
         finally:
             conn.close()
 
+    def _handle_inbox_item(
+        self, item_id: int, new_state: str, note: str | None
+    ) -> None:
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            with conn:
+                cur = conn.execute(
+                    "UPDATE inbox_items "
+                    "SET workflow_state = ?, "
+                    "    attended_at = CASE WHEN ? IN ('attended', 'no-action') "
+                    "                       THEN datetime('now') ELSE attended_at END "
+                    "WHERE id = ?",
+                    (new_state, new_state, item_id),
+                )
+                if cur.rowcount and note:
+                    conn.execute(
+                        "INSERT INTO audit_log (actor_kind, action, target_kind, "
+                        "  target_id, payload_json) "
+                        "VALUES ('agent', 'inbox_handled', 'inbox_item', ?, ?)",
+                        (item_id, json.dumps({"state": new_state, "note": note})),
+                    )
+        finally:
+            conn.close()
+        logger.info(
+            "inbox item #%s → %s (%s)",
+            item_id, new_state, note or "no note",
+        )
+
     def _unlock_phase(self, new_phase: int, approver_uid: int) -> bool:
         """Bump the tenant's phase in platform.tenants if the new phase is higher."""
         pconn = _connect(self.cfg.platform_db)
@@ -1398,17 +1530,17 @@ class COOBot(discord.Client):
         amendment = (
             "[[BRIDGE_NOTICE]] The Discord listener restarted. You are still "
             "connected; do NOT re-introduce yourself. Continue the conversation.\n\n"
-            "MODEL CHANGE: there is no longer an allowlist or an inbox.\n"
-            "  - Anyone in the company server can DM you and EVERY DM reaches you.\n"
-            "  - Each relay carries the sender's role (developer / CEO / manager / "
-            "employee). Weight your responses by role; developers' commands carry "
-            "the most technical weight, CEO is content authority, managers are "
-            "scoped to their team, employees are the default.\n"
-            "  - Unknown senders are auto-registered as employees in the people "
-            "table; you can update their role/team later via [[COO_FACT]] markers.\n"
-            "  - Don't try to be a help desk. If something is outside your scope "
-            "(payroll, HR specifics, vendor disputes), say so briefly and route "
-            "the person to the right human.\n\n"
+            "MODEL UPDATE (replaces the previous notice):\n"
+            "  - Gate for inbound DMs = ORG CHART membership (people table).\n"
+            "  - In-org-chart DMs reach you in real time, weighted by role.\n"
+            "  - Out-of-org-chart DMs land in the inbox, surfaced via the daily\n"
+            "    brief — NOT auto-added as employees.\n"
+            "  - To grow the org chart, emit [[COO_PERSON_ADD user_id=N\n"
+            "    name=\"...\" role=\"...\" team=\"...\" access_tier=\"manager|employee\"]].\n"
+            "    Required before that person's DMs reach you. [[COO_TO]] still\n"
+            "    works for anyone you want to introduce yourself to.\n"
+            "  - Don't try to be a help desk; route out-of-scope asks (payroll,\n"
+            "    HR specifics, vendor disputes) to the right human.\n\n"
             "VOICE UPDATE — speak like a real COO, not an AI:\n"
             "  - You ARE the COO. Drop 'I'm the COO agent' framing forever.\n"
             "  - No greetings after the first DM to a person. No 'Hi <Name>',\n"
@@ -1442,8 +1574,18 @@ class COOBot(discord.Client):
         sender_id = message.author.id
         content = message.content or ""
 
+        # Gate: only people IN THE ORG CHART (people table, with a Discord ID)
+        # get forwarded to the agent. Anyone else → inbox for later triage.
+        person_id = await asyncio.to_thread(self._person_id_for_uid, sender_id)
+        if person_id is None:
+            await asyncio.to_thread(
+                save_inbox_item, self.cfg,
+                message.author, content, message.id, message.channel.id,
+            )
+            return
+
         # Reload the role map so newly-added managers / developers are reflected
-        # without a restart. allowlist now == role lookup, not a gate.
+        # without a restart. It's used for role weighting in the relay.
         self.allowlist = await asyncio.to_thread(load_allowlist, self.cfg)
         sender = self.allowlist.get(sender_id) or {
             "name": message.author.display_name or message.author.name,
@@ -1452,7 +1594,7 @@ class COOBot(discord.Client):
             "tier": "employee",
         }
         logger.info(
-            "DM from %s (uid=%s, role=%s)",
+            "DM from %s (uid=%s, role=%s) — in org chart",
             sender["name"], sender_id, sender.get("role"),
         )
 
@@ -1473,21 +1615,12 @@ class COOBot(discord.Client):
                         cancel_first=False,
                     )
 
-        # Make sure a `people` row exists for unknown senders, so the agent
-        # can record facts/commitments against them with proper provenance.
-        person_id = await asyncio.to_thread(self._person_id_for_uid, sender_id)
-        if person_id is None:
-            person_id = await asyncio.to_thread(
-                self._auto_register_person, sender_id,
-                sender["name"], sender.get("handle") or message.author.name,
+        self._last_asserter_person_id = person_id
+        iid = await asyncio.to_thread(self._ensure_interview, person_id)
+        if iid is not None:
+            await asyncio.to_thread(
+                self._append_transcript, iid, "user", sender["name"], content
             )
-        if person_id is not None:
-            self._last_asserter_person_id = person_id
-            iid = await asyncio.to_thread(self._ensure_interview, person_id)
-            if iid is not None:
-                await asyncio.to_thread(
-                    self._append_transcript, iid, "user", sender["name"], content
-                )
 
         prompt = relay_prompt(sender, sender_id, content)
         await self._send_to_agent(prompt, cancel_first=False)
@@ -1601,6 +1734,18 @@ class COOBot(discord.Client):
             pid = await asyncio.to_thread(self._person_id_for_uid, uid)
             if pid is not None:
                 await asyncio.to_thread(self._close_interview, pid)
+
+        for m in COO_INBOX_HANDLE_RE.finditer(response):
+            item_id = int(m.group(1))
+            new_state = m.group(2)
+            note = m.group(3)
+            await asyncio.to_thread(
+                self._handle_inbox_item, item_id, new_state, note
+            )
+
+        for m in COO_PERSON_ADD_RE.finditer(response):
+            fields = _parse_kv(m.group(1))
+            await asyncio.to_thread(self._record_person_add, fields)
 
         for m in COO_APP_ACTION_RE.finditer(response):
             slug = m.group(1)
@@ -1804,6 +1949,30 @@ class COOBot(discord.Client):
                     )
                 # Daily brief also surfaces pending inbox so the agent can
                 # decide whether anything needs CEO attention.
+                if kind == "daily-brief":
+                    inbox = conn.execute(
+                        "SELECT i.id, i.received_at, "
+                        "       substr(i.content, 1, 200) AS preview "
+                        "FROM inbox_items i "
+                        "WHERE i.workflow_state = 'pending' "
+                        "ORDER BY i.received_at DESC LIMIT 10"
+                    ).fetchall()
+                    if inbox:
+                        lines = [
+                            f"  - inbox #{r['id']} @ {r['received_at']}: {r['preview']}"
+                            for r in inbox
+                        ]
+                        parts.append(
+                            "Pending inbox items (DMs from people NOT in the "
+                            "org chart yet):\n"
+                            + "\n".join(lines)
+                            + "\n  For each, triage with "
+                            "[[COO_INBOX_HANDLE id=N state=attended|held|no-action|queued "
+                            'note="<short>"]]. If the person should be in the org '
+                            "chart, add them with [[COO_PERSON_ADD user_id=N "
+                            'name="..." role="..." team="..." access_tier="manager|employee"]] '
+                            "and then DM them — from that point on they can talk to you directly."
+                        )
                 return "\n\n".join(parts) if parts else (
                     "Open commitments: (none recorded)"
                 )
@@ -2296,6 +2465,15 @@ def _register_cockpit(bot: "COOBot") -> None:
         body = await asyncio.to_thread(_cockpit_cadences, bot.cfg)
         await interaction.followup.send(body or "No cadences seeded.", ephemeral=True)
 
+    @group.command(name="inbox", description="Pending DMs from people not yet in the org chart.")
+    async def inbox_cmd(interaction: discord.Interaction):
+        if not _gate(interaction):
+            await interaction.response.send_message("Not in the allowlist.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        body = await asyncio.to_thread(_cockpit_inbox, bot.cfg)
+        await interaction.followup.send(body or "Inbox is empty.", ephemeral=True)
+
     bot.tree.add_command(group)
 
 
@@ -2429,6 +2607,25 @@ def _cockpit_decisions(cfg: Config) -> str:
         body += f"\n   _decided {r['decided_at']}_"
         lines.append(body)
     return "**Recent decisions**\n" + "\n\n".join(lines)
+
+
+def _cockpit_inbox(cfg: Config) -> str:
+    tconn = _connect(cfg.tenant_db)
+    try:
+        rows = tconn.execute(
+            "SELECT id, received_at, substr(content, 1, 200) AS preview "
+            "FROM inbox_items WHERE workflow_state = 'pending' "
+            "ORDER BY received_at DESC LIMIT 20"
+        ).fetchall()
+    finally:
+        tconn.close()
+    if not rows:
+        return ""
+    lines = [
+        f"• #{r['id']} _{r['received_at']}_: {r['preview']}"
+        for r in rows
+    ]
+    return "**Pending inbox** (DMs from people not in the org chart)\n" + "\n".join(lines)
 
 
 def _cockpit_cadences(cfg: Config) -> str:

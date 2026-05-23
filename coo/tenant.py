@@ -1335,6 +1335,39 @@ def tools_cmd(slug: str):
             click.echo(f"  - {r['app']:<20}  {status}")
 
 
+@tenant_cmd.command(name="inbox")
+@click.argument("slug")
+@click.option("--state", help="Filter by workflow_state (pending|attended|held|no-action).")
+@click.option("--limit", default=20, type=int)
+def inbox_cmd(slug: str, state: str | None, limit: int):
+    """Show inbox items (DMs from people NOT in the org chart)."""
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    conn = connect(tenant_db)
+    q = (
+        "SELECT id, received_at, workflow_state, "
+        "       substr(content, 1, 100) AS preview "
+        "FROM inbox_items"
+    )
+    args: list = []
+    if state:
+        q += " WHERE workflow_state = ?"
+        args.append(state)
+    q += " ORDER BY received_at DESC LIMIT ?"
+    args.append(limit)
+    rows = conn.execute(q, args).fetchall()
+    conn.close()
+    if not rows:
+        click.echo("Inbox is empty" + (f" for state={state}" if state else "") + ".")
+        return
+    for r in rows:
+        click.echo(
+            f"  #{r['id']:<4} [{r['workflow_state']:<9}] {r['received_at']}  "
+            f"{r['preview']}"
+        )
+
+
 @tenant_cmd.command(name="workflows")
 @click.argument("slug")
 def workflows_cmd(slug: str):
