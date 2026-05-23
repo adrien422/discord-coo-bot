@@ -395,6 +395,10 @@ class AgentBridge:
         self.cfg = cfg
         self._target = f"{cfg.tmux_session}:agent.0"
         self._last_response_key: str | None = None
+        # Stability gate: a candidate must be seen unchanged across two polls
+        # before it's dispatched, so a still-streaming (partial) reply is never
+        # sent. Holds the last-seen-but-not-yet-stable response key.
+        self._stable_candidate: str | None = None
 
     def ensure_session(self) -> bool:
         """Returns True if a new tmux session was created, False if reused."""
@@ -480,12 +484,9 @@ class AgentBridge:
         )
         return out.stdout
 
-    def latest_response(self) -> str | None:
-        """Extract the latest agent reply (block of `●` lines + body) from the pane.
-
-        Dedup is on the *response text* itself; the pane's bytes drift on
-        every cursor blink so comparing pane snapshots double-fires.
-        """
+    def _extract_response(self) -> str | None:
+        """Extract the latest agent reply block (`●` … up to the next status
+        line) from the pane. No dedup/stability side effects."""
         text = self.capture()
         if not text:
             return None
@@ -515,20 +516,48 @@ class AgentBridge:
         cut = re.search(r"^(✻|✶|⏵|❯)", tail, flags=re.M)
         response = tail[: cut.start() if cut else len(tail)]
         response = re.sub(r"^●\s*", "", response).strip()
+        return response or None
 
+    @staticmethod
+    def _key(response: str) -> str:
+        return re.sub(r"\s+", " ", response).strip()
+
+    def prime(self) -> None:
+        """Mark whatever reply is currently in the pane as already-handled,
+        so a bot restart doesn't re-dispatch the pre-restart reply."""
+        response = self._extract_response()
+        if response and response.strip() != "NOOP":
+            key = self._key(response)
+            self._last_response_key = key
+            self._stable_candidate = key
+
+    def latest_response(self) -> str | None:
+        """Return a NEW, fully-streamed agent reply to dispatch, else None.
+
+        Dedup is on the response text; the pane's bytes drift on every cursor
+        blink so comparing whole-pane snapshots double-fires.
+        """
+        response = self._extract_response()
         if not response:
             return None
 
-        # Suppress only if the entire response is just NOOP. A response that
-        # CONTAINS NOOP at the top but also chains a [[COO_NEXT_CONTACT]] or
-        # other marker still needs to be dispatched so the marker is captured.
+        # Suppress a pure-NOOP reply. A reply that CONTAINS NOOP at the top but
+        # also chains a marker (e.g. [[COO_NEXT_CONTACT]]) still dispatches.
         if response.strip() == "NOOP":
             return None
 
-        # Whitespace-normalised key — TUI re-renders cause raw text to drift
-        # without the actual response changing.
-        dedup_key = re.sub(r"\s+", " ", response).strip()
+        dedup_key = self._key(response)
+
+        # Already dispatched this exact response — suppress.
         if dedup_key == self._last_response_key:
+            return None
+
+        # Stability gate: only dispatch once the response is unchanged across
+        # two consecutive polls. While the agent is still streaming a long
+        # reply the captured block grows each poll, so this holds it back until
+        # it stops changing — preventing partial/duplicate sends.
+        if dedup_key != self._stable_candidate:
+            self._stable_candidate = dedup_key
             return None
 
         self._last_response_key = dedup_key
@@ -1076,13 +1105,15 @@ class COOBot(discord.Client):
     async def _send_to_agent(self, text: str, cancel_first: bool = False) -> None:
         """Serialised paste into Claude's pane; prevents concurrent paste collisions.
 
-        After each send, clear the response-level dedup so the next response
-        Claude produces gets dispatched — even if textually identical to the
-        previous one. Per-marker dedup downstream prevents duplicate side-effects.
+        We deliberately do NOT clear the response dedup here. The capture loop's
+        stability gate already waits for the agent to finish writing, and a
+        genuinely new reply differs from the last dispatched one so it flows
+        through naturally. Clearing would re-dispatch the stale pre-send reply
+        once it 'stabilises'. Downstream per-marker freshness dedup covers the
+        rare case of an identical reply to a new event.
         """
         async with self._send_lock:
             await asyncio.to_thread(self.bridge.send_prompt, text, cancel_first)
-            self.bridge._last_response_key = None
 
     # ----- conversation persistence -----
 
@@ -1623,7 +1654,7 @@ class COOBot(discord.Client):
         else:
             # Bot restarted but agent is still alive. Prime dedup so we
             # don't re-deliver the last response, then send an amendment.
-            await asyncio.to_thread(self.bridge.latest_response)
+            await asyncio.to_thread(self.bridge.prime)
             await self._send_amendment()
 
         self._capture_task = asyncio.create_task(self._capture_loop())
