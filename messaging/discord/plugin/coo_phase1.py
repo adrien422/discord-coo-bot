@@ -394,7 +394,16 @@ class AgentBridge:
             check=True,
         )
         logger.info("created tmux session %s", cfg.tmux_session)
-        time.sleep(2.5)  # let the agent TUI initialise
+        time.sleep(3.0)  # let the agent TUI initialise
+        # Claude Code shows a first-run "trust this folder?" prompt in each
+        # fresh per-tenant workdir. Default option is "Yes, I trust" — accept
+        # it with a single Enter so the agent reaches the normal TUI. (If no
+        # prompt is showing, an Enter at the empty input box is harmless.)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", self._target, "Enter"],
+            timeout=5, check=False,
+        )
+        time.sleep(2.0)
         return True
 
     def _session_exists(self) -> bool:
@@ -1566,7 +1575,10 @@ class COOBot(discord.Client):
     async def _send_initial_mission(self) -> None:
         prompt = mission_prompt(self.cfg, self.allowlist, self.ceo, self.company)
         logger.info("Sending initial mission prompt to agent")
-        await self._send_to_agent(prompt, cancel_first=True)
+        # cancel_first=False: a freshly-launched agent has nothing to Escape,
+        # and Escape would cancel the just-accepted trust prompt's follow-on
+        # state. The trust gate is handled in ensure_session().
+        await self._send_to_agent(prompt, cancel_first=False)
 
     async def _send_amendment(self) -> None:
         """Send a short guidance update when the bot restarts on a live agent."""

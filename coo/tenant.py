@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -46,18 +47,19 @@ Description=COO agent listener — tenant %i
 After=network-online.target
 Wants=network-online.target
 OnFailure=coo-failure-notify@%i.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WorkingDirectory={repo_root_path}
 EnvironmentFile=-%h/.local/share/coo/tenants/%i/messaging/secrets.env
 EnvironmentFile=-/var/coo/tenants/%i/messaging/secrets.env
 ExecStart=/usr/bin/python3 {repo_root_path}/messaging/discord/plugin/coo_phase1.py
 Restart=on-failure
 RestartSec=10s
-StartLimitIntervalSec=300
-StartLimitBurst=5
 StandardOutput=append:%h/.local/share/coo/tenants/%i/state/bot.log
 StandardError=inherit
 
@@ -307,6 +309,9 @@ def new_cmd():
     workdir.mkdir(parents=True, exist_ok=True)
     state_dir = tenant_dir / "state"
     run_ai = repo_root() / "messaging" / "discord" / "plugin" / "run_ai.sh"
+    # Resolve claude's absolute path so the agent launches regardless of the
+    # (minimal) PATH a systemd-user service runs with.
+    claude_bin = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
     secrets_file.write_text(
         f"DISCORD_CLAUDEX_BOT_TOKEN={bot_token}\n"
         f"DISCORD_COO_GUILD_ID={guild_id}\n"
@@ -320,6 +325,7 @@ def new_cmd():
         f"DISCORD_COO_TMUX_SESSION=coo_{slug}\n"
         f"DISCORD_COO_AGENT_KIND=claude\n"
         f"DISCORD_COO_RUN_AI={run_ai}\n"
+        f"COO_CLAUDE_BIN={claude_bin}\n"
         f"CLAUDE_CONFIG_DIR={tenant_dir}/.claude\n"
     )
     secrets_file.chmod(0o600)
