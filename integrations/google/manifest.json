@@ -1,0 +1,18 @@
+{
+  "slug": "google",
+  "name": "Google Workspace",
+  "version": "1",
+  "kind_hint": "workspace",
+  "description": "Connect a Google account so the COO can (1) mirror the live company map to a Google Sheet, (2) mirror factsheets/reports to Google Docs, (3) back up transcripts + reports to a Drive folder, and (4) read/write Workspace files on command. Connect with --mode plugin; the connect flow runs the OAuth SSH-tunnel dance.",
+  "needs_oauth": true,
+  "sync_cadence_seconds": 3600,
+  "suggested_team": "exec",
+  "oauth": {
+    "scopes": [
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/documents",
+      "https://www.googleapis.com/auth/drive"
+    ]
+  },
+  "actions": ["mirror_company_map", "backup_drive", "read_file", "write_doc", "append_sheet", "list_drive"]
+}

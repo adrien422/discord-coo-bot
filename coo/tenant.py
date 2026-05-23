@@ -358,6 +358,10 @@ def new_cmd():
     click.echo(f"  Phase:   1 (DM-only mapping with CEO)")
     click.echo("")
     click.echo(f"Start the bot with:  coo tenant start {slug}")
+    click.echo("")
+    click.echo("Optional — connect a Google account (Sheets/Docs mirror of the")
+    click.echo("company map, Drive backup of transcripts + reports, live read/write):")
+    click.echo(f"  coo integration connect {slug} google --mode plugin --team exec")
 
 
 @tenant_cmd.command(name="start")
