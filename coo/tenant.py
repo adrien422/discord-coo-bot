@@ -1430,40 +1430,6 @@ def reports_cmd(slug: str, kind: str | None):
         )
 
 
-@tenant_cmd.command(name="inbox")
-@click.argument("slug")
-@click.option("--state", help="Filter by workflow_state (pending|queued|held|attended|...).")
-@click.option("--limit", default=20, type=int)
-def inbox_cmd(slug: str, state: str | None, limit: int):
-    """Show inbox items (DMs from non-allowlist users)."""
-    _require_platform_installed()
-    tenant = _get_tenant(slug)
-    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
-    conn = connect(tenant_db)
-    q = (
-        "SELECT i.id, i.received_at, i.workflow_state, "
-        "       COALESCE(p.display_name, '(unknown)') AS sender, "
-        "       substr(i.content, 1, 100) AS preview "
-        "FROM inbox_items i LEFT JOIN people p ON p.id = i.sender_person_id"
-    )
-    args: list = []
-    if state:
-        q += " WHERE i.workflow_state = ?"
-        args.append(state)
-    q += " ORDER BY i.received_at DESC LIMIT ?"
-    args.append(limit)
-    rows = conn.execute(q, args).fetchall()
-    conn.close()
-    if not rows:
-        click.echo("Inbox is empty" + (f" for state={state}" if state else "") + ".")
-        return
-    for r in rows:
-        click.echo(
-            f"  #{r['id']:<4} [{r['workflow_state']:<9}] {r['received_at']}  "
-            f"{r['sender']}: {r['preview']}"
-        )
-
-
 @tenant_cmd.command(name="health")
 @click.argument("slug")
 def health_cmd(slug: str):
