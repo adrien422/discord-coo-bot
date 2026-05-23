@@ -731,6 +731,55 @@ def seed_cadences_cmd(slug: str):
     click.echo(f"Cadences seeded: inserted={inserted}, skipped={skipped}.")
 
 
+@tenant_cmd.command(name="remove-person")
+@click.argument("slug")
+@click.argument("discord_user_id")
+def remove_person_cmd(slug: str, discord_user_id: str):
+    """Soft-remove a person from the org chart (e.g. added by mistake).
+
+    Sets deleted_at so they drop out of the allowlist + interview targets,
+    and cancels any pending follow-up nudges aimed at them. Facts and
+    interviews they were involved in are preserved for audit.
+    """
+    _require_platform_installed()
+    tenant = _get_tenant(slug)
+    tenant_db = Path(tenant["tenant_dir"]) / "db" / "coo.db"
+    if not discord_user_id.isdigit():
+        click.echo("discord_user_id must be numeric.", err=True)
+        sys.exit(1)
+    uid = int(discord_user_id)
+    conn = connect(tenant_db)
+    try:
+        row = conn.execute(
+            "SELECT id, display_name FROM people "
+            "WHERE discord_user_id = ? AND deleted_at IS NULL",
+            (uid,),
+        ).fetchone()
+        if not row:
+            click.echo(f"No active person with Discord ID {uid}.", err=True)
+            sys.exit(1)
+        with transaction(conn):
+            conn.execute(
+                "UPDATE people SET deleted_at = datetime('now') WHERE id = ?",
+                (row["id"],),
+            )
+            cancelled = conn.execute(
+                "UPDATE scheduled_contacts SET status = 'cancelled' "
+                "WHERE person_id = ? AND status = 'pending'",
+                (row["id"],),
+            ).rowcount
+    finally:
+        conn.close()
+    click.echo(
+        f"Removed {row['display_name']} (uid={uid}) from the org chart. "
+        f"Cancelled {cancelled} pending nudge(s)."
+    )
+    click.echo(
+        "Restart the bot so the gate picks it up: "
+        f"coo tenant stop {slug} && coo tenant start {slug}"
+    )
+
+
 @tenant_cmd.command(name="cadences")
 @click.argument("slug")
 def cadences_cmd(slug: str):

@@ -1199,10 +1199,16 @@ class COOBot(discord.Client):
             conn.close()
 
     def _person_id_for_uid(self, discord_user_id: int) -> int | None:
+        """Resolve a Discord uid to an ACTIVE org-chart person (deleted_at NULL).
+
+        Soft-removed people return None, so their DMs fall to the inbox gate
+        rather than reaching the agent.
+        """
         conn = _connect(self.cfg.tenant_db)
         try:
             row = conn.execute(
-                "SELECT id FROM people WHERE discord_user_id = ?",
+                "SELECT id FROM people "
+                "WHERE discord_user_id = ? AND deleted_at IS NULL",
                 (discord_user_id,),
             ).fetchone()
         finally:
