@@ -355,6 +355,27 @@ def load_ceo(cfg: Config) -> dict | None:
     return dict(row) if row else None
 
 
+def load_phase1_targets(cfg: Config) -> list[dict]:
+    """Leadership the agent should interview in Phase 1.
+
+    The primary CEO plus any co-founder / content-approver / admin who's
+    been flagged as a Phase-1 interview target. Primary CEO sorts first.
+    """
+    tconn = _connect(cfg.tenant_db)
+    rows = tconn.execute(
+        "SELECT id, slug, display_name, discord_user_id, role, access_tier, "
+        "       is_content_approver, is_phase1_interview_target "
+        "FROM people "
+        "WHERE deleted_at IS NULL AND discord_user_id IS NOT NULL "
+        "  AND (is_phase1_interview_target = 1 OR is_content_approver = 1 "
+        "       OR access_tier = 'admin' OR discord_user_id = ?) "
+        "ORDER BY (discord_user_id = ?) DESC, id ASC",
+        (cfg.ceo_user_id, cfg.ceo_user_id),
+    ).fetchall()
+    tconn.close()
+    return [dict(r) for r in rows]
+
+
 def load_company_name(cfg: Config) -> str:
     pconn = _connect(cfg.platform_db)
     row = pconn.execute(
@@ -517,11 +538,23 @@ class AgentBridge:
 # -------------------- prompt templates --------------------
 
 
-def mission_prompt(cfg: Config, allowlist: dict[int, dict], ceo: dict, company_name: str) -> str:
+def mission_prompt(
+    cfg: Config, allowlist: dict[int, dict], ceo: dict, company_name: str,
+    targets: list[dict] | None = None,
+) -> str:
     devs = [v for v in allowlist.values() if v["role"] == "developer"]
     dev_lines = "\n".join(f"  - {d['name']} ({d['handle']}, developer, role=developer)" for d in devs) or "  (none registered)"
     dev_ids_csv = ", ".join(
         str(uid) for uid, v in allowlist.items() if v["role"] == "developer"
+    )
+    targets = targets or [ceo]
+    primary_uid = ceo.get("discord_user_id", cfg.ceo_user_id)
+    target_lines = "\n".join(
+        f"  - {t['display_name']} (user_id={t['discord_user_id']}, "
+        f"role: {t.get('role') or '—'}"
+        + (", PRIMARY" if t.get("discord_user_id") == primary_uid else "")
+        + ")"
+        for t in targets
     )
 
     return f"""You are the persistent COO agent for **{company_name}**.
@@ -864,17 +897,37 @@ platform DB and sends you a `[[BRIDGE_PHASE_UNLOCKED phase=N by_uid=...]]`
 notice. After you receive that for phase 2 from BOTH developers, you may
 DM managers freely.
 
+# Phase 1 interview targets (interview these in PARALLEL)
+
+None of these leaders have heard from you yet:
+
+{target_lines}
+
 # First action
 
-The CEO has not yet heard from you. Your first action in this session is
-to DM the CEO with a short, warm introduction (1-2 sentences) and an
+DM EACH of the targets above with a short intro (1-2 sentences) and an
 opening question about **what the company actually does** — product or
-service, who the customer is, the basic shape of the business. Do NOT
-ask about departments or org structure first; that comes after you
-understand what the business is. Do not dump the whole checklist on the
-CEO; work through items one or two at a time across many messages.
+service, who the customer is, the basic shape of the business. Send the
+intros now, in parallel — do NOT wait for one person to reply before
+introducing yourself to the next. Use a separate `[[COO_TO user_id=…]]`
+block per person.
 
-Use the `[[COO_TO user_id={cfg.ceo_user_id}]]` form.
+Running the interviews in parallel:
+  - The PRIMARY target is your main respondent — lean on them for the
+    bulk of the map.
+  - Do NOT ask every target the identical factual question. When one
+    person gives you the org structure / departments / who-owns-what,
+    record it, then CROSS-CHECK with the others ("Sean said X is the
+    top priority — do you see it the same way?") rather than asking
+    from scratch.
+  - For strategic items — priorities, risks, what 'good' looks like in
+    6 months — getting each leader's own view IS valuable. Where they
+    diverge, that disagreement is signal: capture both and surface it.
+  - Track who said what; provenance matters (the bridge records the
+    asserting person automatically).
+  - Don't ask about departments / org structure first; understand what
+    the business is, then go structural. One or two questions per
+    message.
 """
 
 
@@ -1573,8 +1626,14 @@ class COOBot(discord.Client):
         self._integration_task = asyncio.create_task(self._integration_loop())
 
     async def _send_initial_mission(self) -> None:
-        prompt = mission_prompt(self.cfg, self.allowlist, self.ceo, self.company)
-        logger.info("Sending initial mission prompt to agent")
+        targets = await asyncio.to_thread(load_phase1_targets, self.cfg)
+        prompt = mission_prompt(
+            self.cfg, self.allowlist, self.ceo, self.company, targets,
+        )
+        logger.info(
+            "Sending initial mission prompt to agent (%d interview target(s))",
+            len(targets),
+        )
         # cancel_first=False: a freshly-launched agent has nothing to Escape,
         # and Escape would cancel the just-accepted trust prompt's follow-on
         # state. The trust gate is handled in ensure_session().
