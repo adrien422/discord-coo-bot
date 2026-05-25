@@ -52,8 +52,16 @@ logger = logging.getLogger("coo_phase1")
 PASTED_INPUT_RE = re.compile(r"\[Pasted text #\d+ \+\d+ lines\]")
 COO_TO_RE = re.compile(r"\[\[COO_TO user_id=(\d+)\]\]\s*(.+?)(?=(?:\[\[COO_|$))", re.S)
 # Post to a guild channel by name (#connected -> connected) or numeric id.
+# Accept name= or channel= for the name key (the agent reaches for both).
 COO_CHANNEL_RE = re.compile(
-    r'\[\[COO_CHANNEL\s+(?:name="?#?([^"\]\s]+)"?|id=(\d+))\]\]\s*(.+?)(?=(?:\[\[COO_|$))',
+    r'\[\[COO_CHANNEL\s+(?:(?:name|channel)="?#?([^"\]\s]+)"?|id=(\d+))\]\]'
+    r'\s*(.+?)(?=(?:\[\[COO_|$))',
+    re.S,
+)
+# Tolerate the common misfire where the agent puts a channel on a COO_TO
+# marker (e.g. [[COO_TO channel="connected"]] …). Routed to channel posting.
+COO_TO_CHANNEL_MISFIRE_RE = re.compile(
+    r'\[\[COO_TO\s+(?:name|channel)="?#?([^"\]\s]+)"?\]\]\s*(.+?)(?=(?:\[\[COO_|$))',
     re.S,
 )
 COO_FIND_MEMBER_RE = re.compile(r"\[\[COO_FIND_MEMBER query=([^\]]+)\]\]")
@@ -1815,7 +1823,21 @@ class COOBot(discord.Client):
             "  BAD:  'Hi Adrien — I wanted to quickly check on the onboarding\n"
             "         revamp commitment. Could you possibly share status?'\n"
             "  GOOD: 'Adrien — onboarding revamp status by EOD?'\n\n"
-            "Reply NOOP and apply this voice from now on."
+            "NEW CAPABILITY — posting to a server channel:\n"
+            "  - To post in a channel (not a DM), emit:\n"
+            "      [[COO_CHANNEL name=<channel-name>]] <text>\n"
+            "    e.g. [[COO_CHANNEL name=connected]] <your intro>. Use the bare\n"
+            "    channel name (no '#'); or target by id with id=<channel_id>.\n"
+            "  - This is the ONLY channel-post marker. Do NOT use\n"
+            "    [[COO_TO channel=...]] — COO_TO is for DMs (user_id=) only.\n"
+            "  - If the channel is missing or the bot lacks permission, you get\n"
+            "    a [[BRIDGE_CHANNEL_RESULT ok=false]] notice — relay it.\n\n"
+            "SCHEDULING — [[COO_NEXT_CONTACT user_id=N in_seconds=I reason=R]] is\n"
+            "  your ONLY real scheduling mechanism. Your harness's native tools\n"
+            "  (ScheduleWakeup, Cron*) do NOTHING here. Any time you say 'I'll\n"
+            "  follow up in N hours', emit a [[COO_NEXT_CONTACT]] in that reply\n"
+            "  or it won't happen.\n\n"
+            "Reply NOOP and apply all of this from now on."
         )
         logger.info("Sending mission amendment to live agent")
         await self._send_to_agent(amendment, cancel_first=False)
@@ -1967,6 +1989,14 @@ class COOBot(discord.Client):
             posted = await self._post_to_channel(
                 ch_name, int(ch_id) if ch_id else None, text
             )
+            sent_any = sent_any or posted
+
+        # Misfire: [[COO_TO channel="connected"]] <text> — treat as channel post.
+        for m in COO_TO_CHANNEL_MISFIRE_RE.finditer(response):
+            text = normalize_message_text(m.group(2))
+            if not text:
+                continue
+            posted = await self._post_to_channel(m.group(1), None, text)
             sent_any = sent_any or posted
 
         # Active interview for fact/commitment attribution (most recent DM sender)

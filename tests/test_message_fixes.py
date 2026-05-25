@@ -116,6 +116,7 @@ def test_channel_marker_parses_name_id_and_hash():
     cases = {
         "[[COO_CHANNEL name=connected]] Hello team": ("connected", None, "Hello team"),
         '[[COO_CHANNEL name="#connected"]] Hi all': ("connected", None, "Hi all"),
+        "[[COO_CHANNEL channel=connected]] alias key": ("connected", None, "alias key"),
         "[[COO_CHANNEL id=12345]] Posting this": (None, "12345", "Posting this"),
     }
     for text, (name, cid, body) in cases.items():
@@ -124,6 +125,16 @@ def test_channel_marker_parses_name_id_and_hash():
         assert mm.group(1) == name
         assert mm.group(2) == cid
         assert mm.group(3).strip() == body
+
+
+def test_coo_to_channel_misfire_is_caught():
+    # The agent's natural misfire: a channel on a COO_TO marker.
+    text = '[[COO_TO channel="connected"]] I am the new COO.'
+    assert m.COO_TO_RE.search(text) is None        # not a valid DM (no user_id)
+    mm = m.COO_TO_CHANNEL_MISFIRE_RE.search(text)
+    assert mm is not None
+    assert mm.group(1) == "connected"
+    assert mm.group(2).strip() == "I am the new COO."
 
 
 def test_channel_and_dm_markers_coexist():
