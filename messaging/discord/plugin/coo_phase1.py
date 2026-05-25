@@ -51,6 +51,11 @@ logger = logging.getLogger("coo_phase1")
 
 PASTED_INPUT_RE = re.compile(r"\[Pasted text #\d+ \+\d+ lines\]")
 COO_TO_RE = re.compile(r"\[\[COO_TO user_id=(\d+)\]\]\s*(.+?)(?=(?:\[\[COO_|$))", re.S)
+# Post to a guild channel by name (#connected -> connected) or numeric id.
+COO_CHANNEL_RE = re.compile(
+    r'\[\[COO_CHANNEL\s+(?:name="?#?([^"\]\s]+)"?|id=(\d+))\]\]\s*(.+?)(?=(?:\[\[COO_|$))',
+    re.S,
+)
 COO_FIND_MEMBER_RE = re.compile(r"\[\[COO_FIND_MEMBER query=([^\]]+)\]\]")
 COO_FACT_RE = re.compile(
     r'\[\[COO_FACT\s+subject="([^"]+)"\s+predicate="([^"]+)"\s+object="([^"]*)"\]\]'
@@ -128,6 +133,42 @@ def normalize_message_text(text: str) -> str:
     paragraphs = re.split(r"\n\s*\n", text.strip())
     cleaned = [re.sub(r"\s+", " ", p).strip() for p in paragraphs]
     return "\n\n".join(p for p in cleaned if p)
+
+
+def _chunk_message(text: str, limit: int = 1900) -> list[str]:
+    """Split text into Discord-sendable pieces <= limit chars.
+
+    Discord caps a normal message at 2000 chars (slash-command followups too);
+    over-long sends throw HTTP 400 and the whole message is lost. We break on
+    the nicest boundary that fits — paragraph, then line, then sentence, then
+    word, then a hard cut — so a long reply arrives as several messages instead
+    of vanishing.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = limit
+        for sep in ("\n\n", "\n", ". ", " "):
+            idx = window.rfind(sep)
+            if idx > limit * 0.5:          # only accept a break past the midpoint
+                cut = idx + len(sep)
+                break
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return [c for c in chunks if c]
+
+
+async def _send_long_followup(interaction, body: str) -> None:
+    """Send a slash-command response that may exceed Discord's 2000-char
+    followup limit, as one or more ephemeral messages."""
+    for chunk in _chunk_message(body, limit=1990) or ["(empty)"]:
+        await interaction.followup.send(chunk, ephemeral=True)
 COO_NEXT_CONTACT_RE = re.compile(
     r"\[\[COO_NEXT_CONTACT user_id=(\d+) in_seconds=(\d+) reason=([^\]]+)\]\]"
 )
@@ -484,10 +525,28 @@ class AgentBridge:
         )
         return out.stdout
 
+    # The TUI shows "esc to interrupt" on its live status line for the whole
+    # time the agent is generating (or running a tool). Its presence is a hard
+    # "still working" signal — far more reliable than "the text stopped growing
+    # for one poll", which a mid-reply thinking pause also satisfies.
+    _BUSY_RE = re.compile(r"esc to interrupt", re.I)
+
+    def _is_busy(self, text: str) -> bool:
+        """True if the agent is still generating. Only the live status area
+        (pane tail) is checked, so a stale spinner up in scrollback can't
+        wedge us as permanently-busy."""
+        tail = "\n".join(text.splitlines()[-25:])
+        return bool(self._BUSY_RE.search(tail))
+
     def _extract_response(self) -> str | None:
-        """Extract the latest agent reply block (`●` … up to the next status
-        line) from the pane. No dedup/stability side effects."""
+        """Capture the pane and extract the latest agent reply. Convenience
+        wrapper around _extract_from for callers that don't need the raw text."""
         text = self.capture()
+        return self._extract_from(text) if text else None
+
+    def _extract_from(self, text: str) -> str | None:
+        """Extract the latest agent reply block (`●` … up to the next status
+        line) from already-captured pane text. No dedup/stability side effects."""
         if not text:
             return None
 
@@ -537,7 +596,17 @@ class AgentBridge:
         Dedup is on the response text; the pane's bytes drift on every cursor
         blink so comparing whole-pane snapshots double-fires.
         """
-        response = self._extract_response()
+        text = self.capture()
+        if not text:
+            return None
+
+        # Primary done-signal: never dispatch while the agent is still working.
+        # This is what stops a half-written sentence ("…separate from the")
+        # going out when generation pauses mid-reply.
+        if self._is_busy(text):
+            return None
+
+        response = self._extract_from(text)
         if not response:
             return None
 
@@ -552,10 +621,9 @@ class AgentBridge:
         if dedup_key == self._last_response_key:
             return None
 
-        # Stability gate: only dispatch once the response is unchanged across
-        # two consecutive polls. While the agent is still streaming a long
-        # reply the captured block grows each poll, so this holds it back until
-        # it stops changing — preventing partial/duplicate sends.
+        # Secondary guard: require the (idle) reply to be unchanged across two
+        # consecutive polls, to absorb the rare race where the spinner clears a
+        # tick before the final text finishes rendering.
         if dedup_key != self._stable_candidate:
             self._stable_candidate = dedup_key
             return None
@@ -716,14 +784,37 @@ Plain text WITHOUT a `[[COO_TO ...]]` prefix is internal notes and is
 NOT sent to anyone — use plain text to track checklist progress, draft
 factsheets, or think out loud.
 
-# Self-pacing
+# How to post in a server channel
+
+To post a message to a channel in the server (not a DM), emit:
+
+    [[COO_CHANNEL name=<channel-name>]] <your message text>
+
+Use the channel's plain name without the leading '#'
+(e.g. `[[COO_CHANNEL name=connected]] ...`). You can also target by id with
+`[[COO_CHANNEL id=<channel_id>]] <text>`. If the channel can't be found or
+the bot lacks permission to post there, the bridge sends you back a
+`[[BRIDGE_CHANNEL_RESULT ok=false]]` notice explaining why — relay that to
+whoever asked. Use this when someone asks you to introduce yourself or post
+an announcement in a named channel.
+
+# Self-pacing and scheduling
 
 After each meaningful exchange, schedule the next follow-up:
 
     [[COO_NEXT_CONTACT user_id=<id> in_seconds=<int> reason=<short>]]
 
-The bridge schedules the nudge and re-prompts you at that time. Do not
-spawn new sessions.
+The bridge schedules the nudge and re-prompts you at that time, with your
+reason as context. This marker is your ONLY real scheduling mechanism — it
+is the single thing that actually re-pings someone in the future.
+
+You are running inside a harness that also exposes you generic scheduling
+tools (e.g. ScheduleWakeup, CronCreate/CronList). DO NOT use them for COO
+work — they do not drive follow-ups in this system and will silently do
+nothing useful. Whenever you tell someone "I'll follow up in N hours" or
+"I'll check back tomorrow", you MUST emit a `[[COO_NEXT_CONTACT]]` marker in
+that same reply, or the follow-up will never happen. Do not spawn new
+sessions.
 
 # Voice — read this carefully
 
@@ -828,6 +919,8 @@ After the intro, you never reintroduce yourself. You just operate.
 # Markers
 
   - `[[COO_TO user_id=N]] <text>` — DM to that user
+  - `[[COO_CHANNEL name=<channel-name>]] <text>` — post to a server channel
+       (or `id=<channel_id>`). Failure comes back as [[BRIDGE_CHANNEL_RESULT]].
   - `[[COO_FIND_MEMBER query=<name>]]` — search Discord guild for a person
   - `[[COO_NEXT_CONTACT user_id=N in_seconds=I reason=R]]` — schedule a follow-up
   - `[[COO_FACT subject="<id|company|team-slug>" predicate="<pred>" object="<val>"]]`
@@ -1035,7 +1128,10 @@ class COOBot(discord.Client):
         self._integration_last_sync: dict[str, float] = {}
         self.first_start_marker = cfg.state_dir / "first_start_done"
         self._delivered_path = cfg.state_dir / "delivered.json"
-        self._last_delivered: dict[int, str] = self._load_delivered()
+        # uid -> (last message text, unix ts). Dedup only suppresses an
+        # identical resend within DEDUP_WINDOW_SECONDS, so a legitimate repeat
+        # (e.g. a second short "Noted." minutes later) is not swallowed forever.
+        self._last_delivered: dict[int, tuple[str, float]] = self._load_delivered()
         self._inbox_state_path = cfg.state_dir / "inbox_state.json"
         self._inbox_state: dict[str, dict] = self._load_inbox_state()
         self._send_lock = asyncio.Lock()
@@ -1045,12 +1141,20 @@ class COOBot(discord.Client):
         # commitments emitted by the agent in the response that follows.
         self._last_asserter_person_id: int | None = None
 
-    def _load_delivered(self) -> dict[int, str]:
+    DEDUP_WINDOW_SECONDS = 90
+
+    def _load_delivered(self) -> dict[int, tuple[str, float]]:
         if not self._delivered_path.exists():
             return {}
         try:
             data = json.loads(self._delivered_path.read_text())
-            return {int(k): v for k, v in data.items()}
+            out: dict[int, tuple[str, float]] = {}
+            for k, v in data.items():
+                if isinstance(v, list) and len(v) == 2:   # new format [text, ts]
+                    out[int(k)] = (v[0], float(v[1]))
+                else:                                      # legacy format: bare str
+                    out[int(k)] = (v, 0.0)
+            return out
         except Exception:
             logger.exception("failed to load delivered.json; starting empty")
             return {}
@@ -1827,16 +1931,19 @@ class COOBot(discord.Client):
             text = normalize_message_text(m.group(2))
             if not text:
                 continue
-            if self._last_delivered.get(target_id) == text:
+            prev = self._last_delivered.get(target_id)
+            if (prev and prev[0] == text
+                    and (time.time() - prev[1]) < self.DEDUP_WINDOW_SECONDS):
                 logger.info(
-                    "skipping duplicate DM to uid=%s (%d chars, identical to last)",
-                    target_id, len(text),
+                    "skipping duplicate DM to uid=%s (%d chars, identical within %ds)",
+                    target_id, len(text), self.DEDUP_WINDOW_SECONDS,
                 )
                 continue
             try:
                 user = await self.fetch_user(target_id)
-                await user.send(text)
-                self._last_delivered[target_id] = text
+                for chunk in _chunk_message(text):
+                    await user.send(chunk)
+                self._last_delivered[target_id] = (text, time.time())
                 self._save_delivered()
                 logger.info("delivered agent DM to uid=%s (%d chars)", target_id, len(text))
                 sent_any = True
@@ -1850,6 +1957,17 @@ class COOBot(discord.Client):
                         )
             except Exception:
                 logger.exception("failed to DM uid=%s", target_id)
+
+        # Channel posts: [[COO_CHANNEL name=connected]] <text> or id=<snowflake>.
+        for m in COO_CHANNEL_RE.finditer(response):
+            ch_name, ch_id, raw = m.group(1), m.group(2), m.group(3)
+            text = normalize_message_text(raw)
+            if not text:
+                continue
+            posted = await self._post_to_channel(
+                ch_name, int(ch_id) if ch_id else None, text
+            )
+            sent_any = sent_any or posted
 
         # Active interview for fact/commitment attribution (most recent DM sender)
         active_iid: int | None = None
@@ -1963,6 +2081,69 @@ class COOBot(discord.Client):
 
         if not sent_any and not COO_NEXT_CONTACT_RE.search(response) and not queries:
             logger.debug("agent reply with no actionable markers (internal note)")
+
+    async def _resolve_guild(self):
+        guild = self.get_guild(self.cfg.guild_id)
+        if guild is None:
+            try:
+                guild = await self.fetch_guild(self.cfg.guild_id)
+            except Exception:
+                logger.exception("could not fetch guild %s", self.cfg.guild_id)
+        return guild
+
+    async def _post_to_channel(
+        self, name: str | None, channel_id: int | None, text: str
+    ) -> bool:
+        """Post text to a guild text channel by name or id. Returns True on
+        success. On failure, feeds a bridge notice back to the agent so it can
+        tell the user instead of silently failing."""
+        channel = None
+        try:
+            if channel_id is not None:
+                channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
+            elif name:
+                guild = await self._resolve_guild()
+                if guild is not None:
+                    want = name.lower().lstrip("#")
+                    channel = next(
+                        (c for c in guild.text_channels if c.name.lower() == want),
+                        None,
+                    ) or next(
+                        (c for c in guild.text_channels if want in c.name.lower()),
+                        None,
+                    )
+        except Exception:
+            logger.exception("channel lookup failed (name=%r id=%s)", name, channel_id)
+
+        target_desc = f"#{name}" if name else f"id={channel_id}"
+        if channel is None:
+            logger.warning("channel not found: %s", target_desc)
+            await self._send_to_agent(
+                f"[[BRIDGE_CHANNEL_RESULT ok=false]] Could not find channel "
+                f"{target_desc} in the server, so nothing was posted. Tell the "
+                f"user, or ask them for the exact channel name. Reply NOOP if "
+                f"there is nothing else to say.",
+                cancel_first=False,
+            )
+            return False
+        try:
+            for chunk in _chunk_message(text):
+                await channel.send(chunk)
+            logger.info("posted to channel %s (#%s, %d chars)",
+                        channel.id, channel.name, len(text))
+            return True
+        except discord.Forbidden:
+            logger.warning("no permission to post in %s", target_desc)
+            await self._send_to_agent(
+                f"[[BRIDGE_CHANNEL_RESULT ok=false]] I don't have permission to "
+                f"post in #{channel.name}. Tell the user the bot needs Send "
+                f"Messages there. Reply NOOP if there's nothing else to say.",
+                cancel_first=False,
+            )
+            return False
+        except Exception:
+            logger.exception("failed to post to channel %s", target_desc)
+            return False
 
     async def _handle_find_members_batch(self, queries: list[str]) -> None:
         # Wait briefly so any in-flight CEO reply finishes composing before we
@@ -2617,7 +2798,7 @@ def _register_cockpit(bot: "COOBot") -> None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         body = await asyncio.to_thread(_cockpit_facts, bot.cfg, subject)
-        await interaction.followup.send(body or "No facts recorded yet.", ephemeral=True)
+        await _send_long_followup(interaction, body or "No facts recorded yet.")
 
     @group.command(name="commitments", description="Open commitments by owner.")
     async def commitments_cmd(interaction: discord.Interaction):
@@ -2626,7 +2807,7 @@ def _register_cockpit(bot: "COOBot") -> None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         body = await asyncio.to_thread(_cockpit_commitments, bot.cfg)
-        await interaction.followup.send(body or "No open commitments.", ephemeral=True)
+        await _send_long_followup(interaction, body or "No open commitments.")
 
     @group.command(name="decisions", description="Recent decisions log.")
     async def decisions_cmd(interaction: discord.Interaction):
@@ -2635,7 +2816,7 @@ def _register_cockpit(bot: "COOBot") -> None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         body = await asyncio.to_thread(_cockpit_decisions, bot.cfg)
-        await interaction.followup.send(body or "No decisions recorded yet.", ephemeral=True)
+        await _send_long_followup(interaction, body or "No decisions recorded yet.")
 
     @group.command(name="cadences", description="Scheduled cadences and next fire times.")
     async def cadences_cmd(interaction: discord.Interaction):
@@ -2644,7 +2825,7 @@ def _register_cockpit(bot: "COOBot") -> None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         body = await asyncio.to_thread(_cockpit_cadences, bot.cfg)
-        await interaction.followup.send(body or "No cadences seeded.", ephemeral=True)
+        await _send_long_followup(interaction, body or "No cadences seeded.")
 
     @group.command(name="whois", description="Look up a Discord user before adding them to the org chart.")
     @discord.app_commands.describe(user_id="Discord user_id (snowflake)")
@@ -2668,7 +2849,7 @@ def _register_cockpit(bot: "COOBot") -> None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         body = await asyncio.to_thread(_cockpit_inbox, bot.cfg)
-        await interaction.followup.send(body or "Inbox is empty.", ephemeral=True)
+        await _send_long_followup(interaction, body or "Inbox is empty.")
 
     bot.tree.add_command(group)
 
