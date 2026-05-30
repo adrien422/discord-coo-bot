@@ -1,19 +1,29 @@
-"""Google Chat listener for the COO agent — parallel to coo_phase1.py.
+"""Google Chat listener for the COO agent — OAuth + polling architecture.
 
-Pulls events from a Pub/Sub subscription (where the Chat API publishes every
-DM / space event for the configured Chat app), forwards user messages to the
-agent through the shared tmux bridge, captures the agent's reply, parses its
-[[COO_*]] markers, and dispatches them either OUT to Chat (DMs via Chat REST
-API, channel posts to spaces) or INTO the tenant DB.
+Iris's account (iris@projectbyall.com) is OAuth'd once via oauth_bootstrap.py.
+The resulting refresh-token + access-token live in
+  <tenant>/integrations/google/credentials.json
 
-Auth: a service account granted Pub/Sub Subscriber + chat.bot/chat.messages
-scopes. JSON key path in env COO_CHAT_SA_JSON.
+This daemon then:
+  - Polls `spaces.messages.list` every COO_CHAT_POLL_SECONDS for every space
+    Iris is a member of, picking up only messages newer than the last seen one
+    per space (state: poll_state.json).
+  - Skips messages Iris herself sent (so we don't loop on our own replies).
+  - Routes every inbound to the agent via the shared tmux bridge.
+  - Captures the agent's reply, dispatches its [[COO_*]] markers — DMs and
+    channel posts go OUT via `chat.spaces.messages.create`; persistence
+    markers (FACT/COMMITMENT/…) go INTO the tenant DB.
 
-Per-tenant env (set by systemd from the tenant's secrets.env):
+No Chat-app registration. No Pub/Sub. No public URL.
+
+Per-tenant env (set by systemd from <tenant>/messaging/secrets.env):
   COO_TENANT_SLUG, COO_TENANT_DB, COO_PLATFORM_DB, COO_STATE_DIR, COO_WORKDIR,
   COO_TMUX_SESSION, COO_RUN_AI, COO_AGENT_KIND,
-  COO_CHAT_PROJECT_ID, COO_CHAT_SUBSCRIPTION, COO_CHAT_SA_JSON,
-  COO_CHAT_HOME_SPACE, COO_CHAT_CEO_EMAIL, COO_CHAT_COO_DISPLAY_NAME
+  COO_CHAT_CREDS_JSON,     -- path to integrations/google/credentials.json
+  COO_CHAT_CEO_EMAIL,      -- Phase-1 interview target
+  COO_CHAT_COO_DISPLAY_NAME (default 'Iris'),
+  COO_CHAT_POLL_SECONDS    (default 8),
+  COO_CHAT_HOME_SPACE      (optional — fallback for [[COO_CHANNEL]] with no name)
 """
 from __future__ import annotations
 
@@ -26,19 +36,15 @@ import sqlite3
 import sys
 import threading
 import time
-from concurrent.futures import TimeoutError as FuturesTimeoutError
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import requests
-from google.api_core import exceptions as g_exc
-from google.cloud import pubsub_v1
-from google.oauth2 import service_account
-from google.auth.transport.requests import Request as GAuthRequest
 
-# Pull the messaging-agnostic bits from the Discord plugin so we don't fork them.
+# Reuse messaging-agnostic helpers from the Discord plugin.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from messaging.discord.plugin.coo_phase1 import (  # noqa: E402
     AgentBridge,
@@ -48,17 +54,13 @@ from messaging.discord.plugin.coo_phase1 import (  # noqa: E402
     _parse_decision_fields,
     COO_FACT_RE, COO_COMMITMENT_RE, COO_DECISION_RE, COO_WORKFLOW_RE,
     COO_TASK_RE, COO_REPORT_RE, COO_NEXT_CONTACT_RE, COO_CLOSE_RE,
-    COO_CLOSE_USER_RE, COO_PERSON_ADD_RE, COO_INBOX_HANDLE_RE,
-    COO_APP_ACTION_RE, COO_HTTP_CALL_RE, NOOP_RE,
+    COO_PERSON_ADD_RE, COO_INBOX_HANDLE_RE,
+    NOOP_RE,
 )
 
 logger = logging.getLogger("coo_chat")
 
-# ----------------------------------------------------------------------------
-# Chat-flavoured markers
-# Discord's COO_TO_RE expects a numeric user_id. In Chat, the value is the
-# user's email (preferred — durable & readable) or `users/<id>` resource.
-# ----------------------------------------------------------------------------
+# Chat-flavoured markers (same shape as the previous Pub/Sub draft).
 CHAT_TO_RE = re.compile(
     r'\[\[COO_TO\s+(?:user_id|user_email|email)="?([^"\]\s]+)"?\]\]'
     r'\s*(.+?)(?=(?:\[\[COO_|$))',
@@ -69,10 +71,20 @@ CHAT_CHANNEL_RE = re.compile(
     r'\s*(.+?)(?=(?:\[\[COO_|$))',
     re.S,
 )
+# Chat-flavoured COO_COMMITMENT — person_id can be an email or a users/<id>
+# resource (Discord's regex requires digits, which never matches in Chat).
+CHAT_COMMITMENT_RE = re.compile(
+    r'\[\[COO_COMMITMENT\s+person_id="?([^"\s\]]+)"?\s+description="([^"]+)"'
+    r'(?:\s+due="([^"]+)")?\]\]'
+)
+# Chat-flavoured COO_NEXT_CONTACT — user_id is an email or users/<id>.
+CHAT_NEXT_CONTACT_RE = re.compile(
+    r'\[\[COO_NEXT_CONTACT\s+user_id="?([^"\s]+)"?\s+in_seconds=(\d+)\s+reason=([^\]]+)\]\]'
+)
 
 
 # ----------------------------------------------------------------------------
-# Config from env
+# Config
 # ----------------------------------------------------------------------------
 @dataclass
 class Config:
@@ -85,12 +97,11 @@ class Config:
     run_ai: str
     agent_kind: str
 
-    project_id: str
-    subscription: str
-    sa_json: Path
-    home_space: str
+    creds_json: Path
     ceo_email: str
     coo_name: str
+    poll_seconds: int
+    home_space: Optional[str]
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -108,89 +119,147 @@ class Config:
             tmux_session=req("COO_TMUX_SESSION"),
             run_ai=req("COO_RUN_AI"),
             agent_kind=os.environ.get("COO_AGENT_KIND", "claude"),
-            project_id=req("COO_CHAT_PROJECT_ID"),
-            subscription=req("COO_CHAT_SUBSCRIPTION"),
-            sa_json=Path(req("COO_CHAT_SA_JSON")),
-            home_space=req("COO_CHAT_HOME_SPACE"),
+            creds_json=Path(req("COO_CHAT_CREDS_JSON")),
             ceo_email=req("COO_CHAT_CEO_EMAIL"),
             coo_name=os.environ.get("COO_CHAT_COO_DISPLAY_NAME", "Iris"),
+            poll_seconds=int(os.environ.get("COO_CHAT_POLL_SECONDS", "8")),
+            home_space=os.environ.get("COO_CHAT_HOME_SPACE"),
         )
 
 
 # ----------------------------------------------------------------------------
-# Chat REST client (thin)
+# OAuth-as-user Chat API client with self-refresh
 # ----------------------------------------------------------------------------
-class ChatAPI:
-    BASE = "https://chat.googleapis.com/v1"
-    SCOPES = [
-        "https://www.googleapis.com/auth/chat.bot",
-        "https://www.googleapis.com/auth/chat.messages",
-        "https://www.googleapis.com/auth/chat.spaces",
-    ]
+TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v3/userinfo"
+CHAT_BASE = "https://chat.googleapis.com/v1"
 
-    def __init__(self, sa_json: Path):
-        self.creds = service_account.Credentials.from_service_account_file(
-            str(sa_json), scopes=self.SCOPES,
-        )
+
+class UserChatAPI:
+    """Thin Chat REST client backed by a refresh-token-based user OAuth flow."""
+
+    def __init__(self, creds_path: Path):
+        self.path = creds_path
         self._lock = threading.Lock()
+        self.creds = json.loads(creds_path.read_text())
 
-    def _token(self) -> str:
+    # ---- token management ----
+    def _ensure_token(self) -> str:
         with self._lock:
-            if not self.creds.valid:
-                self.creds.refresh(GAuthRequest())
-            return self.creds.token
+            if self.creds.get("access_token") and time.time() < self.creds.get("expires_at", 0):
+                return self.creds["access_token"]
+            resp = requests.post(TOKEN_ENDPOINT, data={
+                "refresh_token": self.creds["refresh_token"],
+                "client_id": self.creds["client_id"],
+                "client_secret": self.creds["client_secret"],
+                "grant_type": "refresh_token",
+            }, timeout=20)
+            if resp.status_code != 200:
+                raise RuntimeError(f"refresh failed ({resp.status_code}): {resp.text[:300]}")
+            tok = resp.json()
+            self.creds["access_token"] = tok["access_token"]
+            self.creds["expires_at"] = int(time.time() + int(tok.get("expires_in", 3600)) - 60)
+            if tok.get("refresh_token"):
+                self.creds["refresh_token"] = tok["refresh_token"]
+            self.path.write_text(json.dumps(self.creds, indent=2))
+            self.path.chmod(0o600)
+            return self.creds["access_token"]
 
     def _hdr(self) -> dict:
-        return {"Authorization": f"Bearer {self._token()}",
+        return {"Authorization": f"Bearer {self._ensure_token()}",
                 "Content-Type": "application/json"}
 
-    def post_message(self, space: str, text: str, *, thread_key: str | None = None) -> dict:
-        """Post a message to a space (`spaces/AAA`). Returns the created message."""
-        url = f"{self.BASE}/{space}/messages"
-        body: dict = {"text": text}
-        if thread_key:
-            body["thread"] = {"threadKey": thread_key}
-        resp = requests.post(url, headers=self._hdr(), json=body, timeout=20)
-        if resp.status_code // 100 != 2:
-            raise RuntimeError(f"Chat post {space} failed ({resp.status_code}): {resp.text[:400]}")
-        return resp.json()
+    # ---- identity ----
+    def me_email(self) -> str:
+        return (self._userinfo().get("email") or "").lower()
 
-    def find_dm(self, user_resource_or_email: str) -> Optional[str]:
-        """Resolve a DM space name for a user. Accepts `users/<id>` or an email.
-        Returns the space name (`spaces/AAA`) or None if not found."""
-        # findDirectMessage expects ?name=users/<user>
-        if "@" in user_resource_or_email and not user_resource_or_email.startswith("users/"):
-            user = f"users/{user_resource_or_email}"
-        else:
-            user = user_resource_or_email
-            if not user.startswith("users/"):
-                user = f"users/{user}"
-        # Note the COLON in `spaces:findDirectMessage` — it's a Google API
-        # "custom verb", not a regular path segment. Using a slash returns
-        # "Missing or malformed space resource name".
-        url = f"{self.BASE}/spaces:findDirectMessage"
+    def me_user_resource(self) -> str:
+        sub = self._userinfo().get("sub")
+        return f"users/{sub}" if sub else ""
+
+    def _userinfo(self) -> dict:
+        # Cache once — userinfo rarely changes.
+        if not hasattr(self, "_userinfo_cache"):
+            resp = requests.get(USERINFO_ENDPOINT, headers=self._hdr(), timeout=15)
+            resp.raise_for_status()
+            self._userinfo_cache = resp.json()
+        return self._userinfo_cache
+
+    # ---- spaces ----
+    def list_spaces(self) -> list[dict]:
+        out: list[dict] = []
+        page_token: Optional[str] = None
+        while True:
+            params = {"pageSize": 100}
+            if page_token:
+                params["pageToken"] = page_token
+            resp = requests.get(f"{CHAT_BASE}/spaces", headers=self._hdr(),
+                                params=params, timeout=20)
+            if resp.status_code != 200:
+                logger.warning("list_spaces %d: %s", resp.status_code, resp.text[:200])
+                return out
+            data = resp.json()
+            out.extend(data.get("spaces", []))
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                return out
+
+    def find_dm(self, user_ref: str) -> Optional[str]:
+        """Resolve a DM space name. `user_ref` may be an email or a `users/<id>`
+        resource — we wrap a bare email as `users/<email>` for the API."""
+        # `:findDirectMessage` is a Google API custom verb — colon, not slash.
+        name = user_ref if user_ref.startswith("users/") else f"users/{user_ref}"
+        url = f"{CHAT_BASE}/spaces:findDirectMessage"
         resp = requests.get(url, headers=self._hdr(),
-                            params={"name": user}, timeout=20)
+                            params={"name": name}, timeout=20)
         if resp.status_code == 200:
             return resp.json().get("name")
-        if resp.status_code == 404:
+        if resp.status_code in (403, 404):
             return None
-        logger.warning("findDirectMessage(%s) %d: %s", user, resp.status_code, resp.text[:200])
+        logger.warning("findDirectMessage(%s) %d: %s", name, resp.status_code,
+                       resp.text[:200])
         return None
 
-    def list_spaces(self) -> list[dict]:
-        """List spaces the bot is a member of. Used for resolving channel posts
-        by name."""
-        url = f"{self.BASE}/spaces"
-        resp = requests.get(url, headers=self._hdr(), timeout=20)
+    # ---- messages ----
+    def list_messages(self, space: str, after_rfc3339: str,
+                      page_size: int = 50) -> list[dict]:
+        """Return messages in `space` with createTime strictly greater than
+        `after_rfc3339`, oldest first."""
+        url = f"{CHAT_BASE}/{space}/messages"
+        params = {
+            "filter": f'createTime > "{after_rfc3339}"',
+            "orderBy": "createTime asc",
+            "pageSize": page_size,
+        }
+        out: list[dict] = []
+        page_token: Optional[str] = None
+        while True:
+            if page_token:
+                params["pageToken"] = page_token
+            resp = requests.get(url, headers=self._hdr(), params=params, timeout=20)
+            if resp.status_code != 200:
+                # 403 on a space is benign (we may not have read perms on every space we joined)
+                if resp.status_code != 403:
+                    logger.warning("list_messages %s %d: %s",
+                                   space, resp.status_code, resp.text[:200])
+                return out
+            data = resp.json()
+            out.extend(data.get("messages", []))
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                return out
+
+    def post_message(self, space: str, text: str) -> dict:
+        url = f"{CHAT_BASE}/{space}/messages"
+        resp = requests.post(url, headers=self._hdr(),
+                             json={"text": text}, timeout=20)
         if resp.status_code // 100 != 2:
-            logger.warning("list spaces %d: %s", resp.status_code, resp.text[:200])
-            return []
-        return resp.json().get("spaces", [])
+            raise RuntimeError(f"post {space} {resp.status_code}: {resp.text[:300]}")
+        return resp.json()
 
 
 # ----------------------------------------------------------------------------
-# Tenant DB helpers — minimal, mirror what discord's COOBot does
+# Tenant DB helpers (same as before, copied/adapted)
 # ----------------------------------------------------------------------------
 def _connect(p: Path) -> sqlite3.Connection:
     c = sqlite3.connect(str(p))
@@ -210,11 +279,48 @@ def load_company_name(cfg: Config) -> str:
         conn.close()
 
 
+def person_by_email(cfg: Config, email: str) -> Optional[sqlite3.Row]:
+    conn = _connect(cfg.tenant_db)
+    try:
+        return conn.execute(
+            "SELECT id, display_name, role, email, access_tier, "
+            "is_content_approver, google_chat_user_id FROM people "
+            "WHERE LOWER(email) = LOWER(?) AND deleted_at IS NULL", (email,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def developer_lookup(cfg: Config, chat_user_id: str | None,
+                     email: str | None) -> Optional[sqlite3.Row]:
+    """Resolve a platform-level developer (Dan, Ivan, …) by Chat user resource
+    or email. Chat API hides email on most senders, so chat_user_id is the
+    primary key; email is a fallback for the rare case it's exposed."""
+    conn = _connect(cfg.platform_db)
+    try:
+        if chat_user_id:
+            row = conn.execute(
+                "SELECT id, handle, display_name, email, google_chat_user_id "
+                "FROM developers WHERE google_chat_user_id = ?",
+                (chat_user_id,),
+            ).fetchone()
+            if row:
+                return row
+        if email:
+            return conn.execute(
+                "SELECT id, handle, display_name, email, google_chat_user_id "
+                "FROM developers WHERE LOWER(email) = LOWER(?)", (email,),
+            ).fetchone()
+    finally:
+        conn.close()
+    return None
+
+
 def person_by_chat_id(cfg: Config, chat_user_id: str) -> Optional[sqlite3.Row]:
     conn = _connect(cfg.tenant_db)
     try:
         return conn.execute(
-            "SELECT id, display_name, role, email, access_tier, is_content_approver "
+            "SELECT id, display_name, role, email, access_tier "
             "FROM people WHERE google_chat_user_id = ? AND deleted_at IS NULL",
             (chat_user_id,),
         ).fetchone()
@@ -222,21 +328,7 @@ def person_by_chat_id(cfg: Config, chat_user_id: str) -> Optional[sqlite3.Row]:
         conn.close()
 
 
-def person_by_email(cfg: Config, email: str) -> Optional[sqlite3.Row]:
-    conn = _connect(cfg.tenant_db)
-    try:
-        return conn.execute(
-            "SELECT id, display_name, role, email, access_tier, is_content_approver, "
-            "       google_chat_user_id "
-            "FROM people WHERE LOWER(email) = LOWER(?) AND deleted_at IS NULL",
-            (email,),
-        ).fetchone()
-    finally:
-        conn.close()
-
-
 def upsert_chat_user_id(cfg: Config, person_id: int, chat_user_id: str) -> None:
-    """Backfill a person's google_chat_user_id once we see them on Chat."""
     conn = _connect(cfg.tenant_db)
     try:
         with conn:
@@ -249,8 +341,7 @@ def upsert_chat_user_id(cfg: Config, person_id: int, chat_user_id: str) -> None:
         conn.close()
 
 
-def ensure_channel(cfg: Config, space_name: str, platform_id: str, kind: str = "dm") -> int:
-    """Idempotent: row in channels for this space."""
+def ensure_channel(cfg: Config, name: str, platform_id: str, kind: str = "dm") -> int:
     conn = _connect(cfg.tenant_db)
     try:
         row = conn.execute(
@@ -261,15 +352,14 @@ def ensure_channel(cfg: Config, space_name: str, platform_id: str, kind: str = "
         with conn:
             cur = conn.execute(
                 "INSERT INTO channels (platform_channel_id, name, kind) VALUES (?, ?, ?)",
-                (platform_id, space_name, kind),
+                (platform_id, name, kind),
             )
             return cur.lastrowid
     finally:
         conn.close()
 
 
-def ensure_interview(cfg: Config, person_id: int, channel_id: int | None) -> int:
-    """Return the open interview id for this person (create if none)."""
+def ensure_interview(cfg: Config, person_id: int, channel_id: Optional[int]) -> int:
     conn = _connect(cfg.tenant_db)
     try:
         row = conn.execute(
@@ -291,7 +381,6 @@ def ensure_interview(cfg: Config, person_id: int, channel_id: int | None) -> int
 
 def append_transcript(cfg: Config, interview_id: int, role: str,
                       who: str, text: str) -> None:
-    """Append a line to the interview's transcript file on disk."""
     conn = _connect(cfg.tenant_db)
     try:
         row = conn.execute(
@@ -300,8 +389,8 @@ def append_transcript(cfg: Config, interview_id: int, role: str,
         path = Path(row["transcript_path"]) if row and row["transcript_path"] else None
         if not path:
             date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            who_slug = re.sub(r"[^a-z0-9]+", "-", who.lower()).strip("-") or "person"
-            path = cfg.state_dir.parent / "transcripts" / date / f"{who_slug}.md"
+            slug = re.sub(r"[^a-z0-9]+", "-", who.lower()).strip("-") or "person"
+            path = cfg.state_dir.parent / "transcripts" / date / f"{slug}.md"
             path.parent.mkdir(parents=True, exist_ok=True)
             with conn:
                 conn.execute(
@@ -315,36 +404,7 @@ def append_transcript(cfg: Config, interview_id: int, role: str,
         f.write(f"[{ts}] **{role}** ({who}): {text}\n\n")
 
 
-def record_fact(cfg: Config, subject: str, predicate: str, object_text: str,
-                asserter_pid: Optional[int], interview_id: Optional[int]) -> None:
-    """Insert a fact with 300s freshness dedup on (subject, predicate, object)."""
-    subj_kind, subj_id = _resolve_subject(cfg, subject)
-    conn = _connect(cfg.tenant_db)
-    try:
-        dup = conn.execute(
-            "SELECT id FROM facts WHERE subject_kind = ? AND "
-            "       (subject_id IS ? OR subject_id = ?) AND "
-            "       predicate = ? AND object_text = ? AND "
-            "       asserted_at > datetime('now', '-300 seconds') AND is_current = 1",
-            (subj_kind, subj_id, subj_id, predicate, object_text),
-        ).fetchone()
-        if dup:
-            return
-        with conn:
-            conn.execute(
-                "INSERT INTO facts (subject_kind, subject_id, predicate, object_text, "
-                "  asserted_by_person_id, asserted_at, source_interview_id) "
-                "VALUES (?, ?, ?, ?, ?, datetime('now'), ?)",
-                (subj_kind, subj_id, predicate, object_text, asserter_pid, interview_id),
-            )
-        logger.info("fact recorded: %s:%s %s = %r", subj_kind, subj_id, predicate, object_text)
-    finally:
-        conn.close()
-
-
 def _resolve_subject(cfg: Config, subject: str) -> tuple[str, Optional[int]]:
-    """'company' -> (company, None); '<team-slug>' -> (team, id);
-    '<email-or-chat-id>' -> (person, id)."""
     if subject == "company":
         return ("company", None)
     conn = _connect(cfg.tenant_db)
@@ -372,11 +432,62 @@ def _resolve_subject(cfg: Config, subject: str) -> tuple[str, Optional[int]]:
     return ("company", None)
 
 
-def record_commitment(cfg: Config, who_email_or_id: str, description: str,
-                      due: Optional[str], interview_id: Optional[int]) -> None:
-    kind, sid = _resolve_subject(cfg, who_email_or_id)
+def record_fact(cfg: Config, subject: str, predicate: str, object_text: str,
+                asserter_pid: Optional[int], interview_id: Optional[int]) -> None:
+    kind, sid = _resolve_subject(cfg, subject)
+    conn = _connect(cfg.tenant_db)
+    try:
+        dup = conn.execute(
+            "SELECT id FROM facts WHERE subject_kind = ? AND "
+            "(subject_id IS ? OR subject_id = ?) AND predicate = ? AND object_text = ? "
+            "AND asserted_at > datetime('now','-300 seconds') AND is_current = 1",
+            (kind, sid, sid, predicate, object_text),
+        ).fetchone()
+        if dup:
+            return
+        with conn:
+            conn.execute(
+                "INSERT INTO facts (subject_kind, subject_id, predicate, object_text, "
+                "  asserted_by_person_id, asserted_at, source_interview_id) "
+                "VALUES (?, ?, ?, ?, ?, datetime('now'), ?)",
+                (kind, sid, predicate, object_text, asserter_pid, interview_id),
+            )
+        logger.info("fact recorded: %s:%s %s = %r", kind, sid, predicate, object_text)
+    finally:
+        conn.close()
+
+
+def record_scheduled_contact(cfg: Config, who: str, in_seconds: int, reason: str) -> None:
+    kind, sid = _resolve_subject(cfg, who)
     if kind != "person" or sid is None:
-        logger.warning("commitment for unknown person %r — skipped", who_email_or_id)
+        logger.warning("scheduled_contact for unknown person %r — skipped", who)
+        return
+    conn = _connect(cfg.tenant_db)
+    try:
+        # 60s freshness dedup so re-emits don't double-schedule
+        dup = conn.execute(
+            "SELECT id FROM scheduled_contacts WHERE person_id = ? AND reason = ? "
+            "AND status = 'pending' AND created_at > datetime('now','-60 seconds')",
+            (sid, reason),
+        ).fetchone()
+        if dup:
+            return
+        with conn:
+            conn.execute(
+                "INSERT INTO scheduled_contacts (person_id, fire_at, reason, status) "
+                "VALUES (?, datetime('now', ?), ?, 'pending')",
+                (sid, f"+{int(in_seconds)} seconds", reason),
+            )
+        logger.info("scheduled_contact uid=%s in %ss: %s", who, in_seconds, reason)
+    finally:
+        conn.close()
+
+
+def record_commitment(cfg: Config, who: str, description: str,
+                      due: Optional[str], interview_id: Optional[int]) -> None:
+    kind, sid = _resolve_subject(cfg, who)
+    if kind != "person" or sid is None:
+        logger.warning("commitment for unknown person %r — skipped", who)
         return
     conn = _connect(cfg.tenant_db)
     try:
@@ -410,7 +521,7 @@ def record_decision(cfg: Config, title: str, body: str, rationale: Optional[str]
 
 
 # ----------------------------------------------------------------------------
-# Mission prompt — Iris-flavoured opener
+# Mission prompt
 # ----------------------------------------------------------------------------
 def chat_mission_prompt(cfg: Config, company: str, ceo_name: str, ceo_email: str) -> str:
     return f"""You are **{cfg.coo_name}**, the persistent COO agent for **{company}**.
@@ -443,7 +554,7 @@ The bridge resolves the email to a Chat DM and posts it. Plain text WITHOUT a
 `[[COO_TO …]]` prefix is internal notes — NOT sent to anyone. Use plain text
 for checklist progress, factsheet drafts, thinking out loud.
 
-To post in a server channel/space:
+To post in a space:
 
     [[COO_CHANNEL name=<space-name>]] <text>
 
@@ -482,21 +593,8 @@ Track progress as internal notes (plain text, no [[COO_TO]] prefix).
   - [[COO_FACT subject="<email|company|team-slug>" predicate="<pred>" object="<val>"]]
   - [[COO_COMMITMENT person_id="<email>" description="<text>" due="YYYY-MM-DD"]]
   - [[COO_DECISION title="<title>" text="<what>" rationale="<why>" scope="<email|company|team-slug>"]]
-  - [[COO_WORKFLOW slug="<slug>" name="<name>" description="<text>" owner_team="<team-slug>"]]
-  - [[COO_TASK title="<text>" owner_person_id="<email>" status="pending|active|blocked|done|dropped" due="YYYY-MM-DD"]]
-  - [[COO_REPORT kind=factsheet-team|factsheet-person|org-chart|priorities subject="<email|company|team-slug>" title="<text>"]]
-      <markdown body>
-      [[/COO_REPORT]]
   - [[COO_PERSON_ADD user_id="<email>" name="<display>" role="<role>" team="<team-slug>" access_tier="manager|employee|strategic|admin"]]
-  - [[COO_INBOX_HANDLE id=<N> state=attended|held|no-action|queued note="<short>"]]
   - NOOP (whole-reply silence)
-
-# Voice
-
-You ARE {cfg.coo_name}. Not an AI playing a COO. Lead with the question or the
-call. Imperative when you have a view ("Pushing GA to Q4. Push back if I'm
-wrong."). Names, not "you all". One or two sentences default; longer only when
-announcing a decision, escalating, or writing a factsheet.
 
 Start now: open a DM to **{ceo_name}** ({ceo_email}). Introduce yourself
 briefly (your name, your role at {company}, what you do), then open Phase 1
@@ -505,29 +603,33 @@ with the company-context question.
 
 
 # ----------------------------------------------------------------------------
-# The listener / dispatcher
+# Listener
 # ----------------------------------------------------------------------------
 class ChatListener:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.bridge = AgentBridge(_pretend_discord_cfg(cfg))
-        self.chat = ChatAPI(cfg.sa_json)
+        self.chat = UserChatAPI(cfg.creds_json)
         self.company = load_company_name(cfg)
-        # uid -> (last text, ts) — same dedup-window scheme as Discord
-        self._last_delivered: dict[str, tuple[str, float]] = {}
+        self.me_email = self.chat.me_email()
+        self.me_user = self.chat.me_user_resource()    # 'users/<sub>'
+        logger.info("authenticated as %s (%s)", self.me_email, self.me_user)
+        # state files
         self._delivered_path = cfg.state_dir / "delivered.json"
+        self._last_delivered: dict[str, tuple[str, float]] = {}
         self._load_delivered()
+        self._poll_state_path = cfg.state_dir / "poll_state.json"
+        self._last_seen: dict[str, str] = {}
+        self._load_poll_state()
+        self._space_by_name: dict[str, dict] = {}     # lower(displayName) -> space dict
+        self._email_to_space: dict[str, str] = {}     # email -> DM space name
         self._send_lock = threading.Lock()
         self._last_asserter_pid: Optional[int] = None
         self._stop = threading.Event()
-        # Cache: email -> chat_user_id (filled as users DM in)
-        self._email_to_user: dict[str, str] = {}
-        # Cache: lower(name) -> space
-        self._space_by_name: dict[str, dict] = {}
 
     DEDUP_WINDOW_SECONDS = 90
 
-    # ---- persistence of dedup state ----
+    # ---- state persistence ----
     def _load_delivered(self) -> None:
         if not self._delivered_path.exists():
             return
@@ -535,113 +637,174 @@ class ChatListener:
             data = json.loads(self._delivered_path.read_text())
             self._last_delivered = {k: (v[0], float(v[1])) for k, v in data.items()}
         except Exception:
-            logger.exception("failed to load delivered.json")
+            logger.exception("delivered.json load failed")
 
     def _save_delivered(self) -> None:
         try:
             self._delivered_path.parent.mkdir(parents=True, exist_ok=True)
             self._delivered_path.write_text(json.dumps(self._last_delivered))
         except Exception:
-            logger.exception("failed to save delivered.json")
+            logger.exception("delivered.json save failed")
 
-    # ---- chat space resolution ----
-    def _resolve_space(self, name_or_id: str) -> Optional[str]:
+    def _load_poll_state(self) -> None:
+        if not self._poll_state_path.exists():
+            return
+        try:
+            self._last_seen = json.loads(self._poll_state_path.read_text())
+        except Exception:
+            logger.exception("poll_state.json load failed")
+
+    def _save_poll_state(self) -> None:
+        try:
+            self._poll_state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._poll_state_path.write_text(json.dumps(self._last_seen))
+        except Exception:
+            logger.exception("poll_state.json save failed")
+
+    # ---- space resolution ----
+    def _refresh_spaces(self) -> list[dict]:
+        spaces = self.chat.list_spaces()
+        self._space_by_name = {}
+        for sp in spaces:
+            disp = (sp.get("displayName") or "").lower()
+            if disp:
+                self._space_by_name[disp] = sp
+        return spaces
+
+    def _resolve_space_name_or_id(self, name_or_id: str) -> Optional[str]:
         if name_or_id.startswith("spaces/"):
             return name_or_id
         key = name_or_id.lower().lstrip("#")
-        if key in self._space_by_name:
-            return self._space_by_name[key].get("name")
-        for sp in self.chat.list_spaces():
-            self._space_by_name[(sp.get("displayName") or "").lower()] = sp
+        sp = self._space_by_name.get(key)
+        if sp:
+            return sp.get("name")
+        # Refresh and try again
+        self._refresh_spaces()
         sp = self._space_by_name.get(key)
         return sp.get("name") if sp else None
 
-    # ---- inbound: Pub/Sub event handlers ----
-    def handle_event(self, evt: dict) -> None:
-        et = evt.get("type")
-        if et == "MESSAGE":
-            self._on_message(evt)
-        elif et == "ADDED_TO_SPACE":
-            self._on_added(evt)
-        elif et == "REMOVED_FROM_SPACE":
-            logger.info("removed from %s", (evt.get("space") or {}).get("name"))
-        else:
-            logger.info("unhandled event type=%s", et)
+    def _resolve_dm_for_email(self, email: str) -> Optional[str]:
+        e = email.lower()
+        if e in self._email_to_space:
+            return self._email_to_space[e]
+        space = self.chat.find_dm(e)
+        if space:
+            self._email_to_space[e] = space
+        return space
 
-    def _on_message(self, evt: dict) -> None:
-        msg = evt.get("message") or {}
+    # ---- inbound: poll once ----
+    def poll_once(self) -> int:
+        """Pull new messages from every space and dispatch. Returns count."""
+        n = 0
+        spaces = self._refresh_spaces()
+        now_rfc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        for sp in spaces:
+            name = sp.get("name") or ""
+            if not name:
+                continue
+            last = self._last_seen.get(name)
+            if last is None:
+                # First time we see this space — skip its backlog
+                self._last_seen[name] = now_rfc
+                continue
+            msgs = self.chat.list_messages(name, last)
+            for msg in msgs:
+                sender = msg.get("sender") or {}
+                user_resource = sender.get("name") or ""
+                email = (sender.get("email") or "").lower()
+                # Filter by user_id primarily (email is hidden on most senders);
+                # falls back to email when present.
+                if user_resource == self.me_user or (email and email == self.me_email):
+                    self._last_seen[name] = msg.get("createTime", last)
+                    continue
+                self._handle_message(sp, msg)
+                self._last_seen[name] = msg.get("createTime", self._last_seen[name])
+                n += 1
+        if n or spaces:
+            self._save_poll_state()
+        return n
+
+    def _handle_message(self, space: dict, msg: dict) -> None:
         sender = msg.get("sender") or {}
-        space = evt.get("space") or {}
-        space_name = space.get("name") or ""
-        user_resource = sender.get("name") or ""    # e.g. "users/123"
-        email = sender.get("email") or ""
+        email = (sender.get("email") or "").lower()
         display = sender.get("displayName") or email or "Unknown"
+        user_resource = sender.get("name") or ""
         text = msg.get("argumentText") or msg.get("text") or ""
-
         if not text.strip():
             return
 
-        # Cache email <-> user_resource for outbound DM resolution later.
-        if email and user_resource:
-            self._email_to_user[email.lower()] = user_resource
+        # Cache email <-> space (so we know how to DM them back)
+        space_name = space.get("name") or ""
+        if email and space.get("type") == "DIRECT_MESSAGE":
+            self._email_to_space[email] = space_name
 
+        # Person lookup — try Chat user_id first, then email (often hidden).
         person = (person_by_chat_id(self.cfg, user_resource) if user_resource else None)
         if person is None and email:
             person = person_by_email(self.cfg, email)
             if person and user_resource:
                 upsert_chat_user_id(self.cfg, person["id"], user_resource)
-        if person is None:
-            # TODO inbox path. For v1 we log and bail.
-            logger.info("DM from %s <%s> NOT in org chart — ignoring for v1",
-                        display, email)
+        elif person and user_resource:
+            upsert_chat_user_id(self.cfg, person["id"], user_resource)
+
+        dev = developer_lookup(self.cfg, user_resource, email)
+        if not person and not dev:
+            logger.info("msg from %s <%s/%s> in %s — not in org chart, not a developer — ignoring",
+                        display, email, user_resource, space_name)
             return
 
-        logger.info("DM from %s <%s> — relaying to agent", display, email)
-        self._last_asserter_pid = person["id"]
+        # Pretty label + ALWAYS fill email from the DB row (Chat hides it on
+        # the sender object). Without this the agent has to guess and gets it
+        # wrong, killing every outbound DM.
+        if dev:
+            display = dev["display_name"] or display
+            role_label = "developer"
+            email = (dev["email"] or email or "").lower()
+        else:
+            role_label = (person["role"] or "—") if person else "—"
+            if person and person["email"]:
+                email = person["email"].lower()
+        logger.info("msg from %s <%s/%s> (%s) in %s — relaying to agent",
+                    display, email, user_resource, role_label,
+                    space.get("displayName") or space_name)
 
-        channel_id = ensure_channel(self.cfg, display, space_name, kind="dm")
-        interview_id = ensure_interview(self.cfg, person["id"], channel_id)
-        append_transcript(self.cfg, interview_id, "user", display, text)
+        # Developers get straight through to the agent without an interview row;
+        # they're not being "interviewed" for the company map.
+        interview_id: Optional[int] = None
+        if person is not None:
+            self._last_asserter_pid = person["id"]
+            channel_id = ensure_channel(
+                self.cfg, space.get("displayName") or display, space_name,
+                kind="dm" if space.get("type") == "DIRECT_MESSAGE" else "general",
+            )
+            interview_id = ensure_interview(self.cfg, person["id"], channel_id)
+            append_transcript(self.cfg, interview_id, "user", display, text)
+        else:
+            # Cache DM space for outbound replies to this developer.
+            if email and space.get("type") == "DIRECT_MESSAGE":
+                self._email_to_space[email] = space_name
 
+        # Include user_id so the agent can address by Chat resource if email
+        # is somehow ambiguous later. Email is the natural reply key.
         prompt = (
-            f"[[INCOMING_DM from={display} email={email} role={person['role'] or '—'}]]\n\n"
+            f"[[INCOMING_DM from={display} email={email or '(unknown)'} "
+            f"user_id={user_resource or '(unknown)'} role={role_label}]]\n\n"
             f"  {text}\n\n"
-            f"Respond as the persistent COO agent. Use `[[COO_TO user_id=<email>]]` "
-            f"for replies that should go to Chat. Plain text is internal notes only."
+            f"Respond as the persistent COO agent. Use `[[COO_TO user_id={email or user_resource}]]` "
+            f"to reply (use the exact email above — do NOT guess). Plain text is internal notes only."
         )
         with self._send_lock:
             self.bridge.send_prompt(prompt, cancel_first=False)
 
-    def _on_added(self, evt: dict) -> None:
-        """Bot was added to a DM or space — opportunity to greet."""
-        space = evt.get("space") or {}
-        user = evt.get("user") or {}
-        email = (user.get("email") or "").lower()
-        logger.info("added to space=%s by %s", space.get("name"), email)
-        # Send a nudge into the agent so it knows to introduce itself
-        if email:
-            prompt = (
-                f"[[BRIDGE_NOTICE]] You were just added to a Chat DM by {email}. "
-                f"If this is the CEO ({self.cfg.ceo_email}), open Phase 1 now — "
-                f"emit [[COO_TO user_id={email}]] with your intro + the first "
-                f"company-context question."
-            )
-            with self._send_lock:
-                self.bridge.send_prompt(prompt, cancel_first=False)
-
     # ---- outbound: dispatch agent reply ----
     def dispatch_response(self, response: str) -> None:
         sent_any = False
-
-        # 1. DMs via [[COO_TO user_id=<email>]] <text>
         for m in CHAT_TO_RE.finditer(response):
             target = m.group(1)
             text = normalize_message_text(m.group(2))
             if not text:
                 continue
             sent_any |= self._send_dm(target, text)
-
-        # 2. Channel posts via [[COO_CHANNEL name=… | id=…]] <text>
         for m in CHAT_CHANNEL_RE.finditer(response):
             name, sid, raw = m.group(1), m.group(2), m.group(3)
             text = normalize_message_text(raw)
@@ -649,83 +812,86 @@ class ChatListener:
                 continue
             sent_any |= self._post_channel(name or sid, text)
 
-        # Active interview (for fact / commitment attribution)
+        # active interview for fact / commitment attribution
         active_iid: Optional[int] = None
         if self._last_asserter_pid is not None:
             active_iid = ensure_interview(self.cfg, self._last_asserter_pid, None)
 
-        # 3. Persistence markers
         for m in COO_FACT_RE.finditer(response):
             record_fact(self.cfg, m.group(1), m.group(2), m.group(3),
                         self._last_asserter_pid, active_iid)
-        for m in COO_COMMITMENT_RE.finditer(response):
-            # COO_COMMITMENT in coo_phase1 expects numeric person_id; we
-            # accept email here via our own loose parsing.
-            kv = _parse_kv(m.group(0)[2:-2])
-            who = kv.get("person_id") or kv.get("user_id") or kv.get("email") or ""
-            desc = kv.get("description", "")
-            due = kv.get("due")
+        for m in CHAT_COMMITMENT_RE.finditer(response):
+            who, desc, due = m.group(1), m.group(2), m.group(3)
             if who and desc:
                 record_commitment(self.cfg, who, desc, due, active_iid)
         for m in COO_DECISION_RE.finditer(response):
             title, body, rationale, scope = _parse_decision_fields(m.group(1))
             if title and body:
                 record_decision(self.cfg, title, body, rationale, scope, active_iid)
-        # TODO: workflow / task / report / person_add / inbox_handle / app_action /
-        # http_call / scheduled_contact — fill in after the round-trip works.
+        for m in CHAT_NEXT_CONTACT_RE.finditer(response):
+            who, secs, reason = m.group(1), int(m.group(2)), m.group(3).strip()
+            record_scheduled_contact(self.cfg, who, secs, reason)
 
         if not sent_any and "NOOP" not in response.upper():
             logger.debug("agent reply had no actionable markers")
 
-    def _send_dm(self, target_email_or_resource: str, text: str) -> bool:
-        # Dedup
-        prev = self._last_delivered.get(target_email_or_resource)
+    def _send_dm(self, target: str, text: str) -> bool:
+        prev = self._last_delivered.get(target)
         if prev and prev[0] == text and (time.time() - prev[1]) < self.DEDUP_WINDOW_SECONDS:
             logger.info("skipping duplicate DM to %s (within %ds)",
-                        target_email_or_resource, self.DEDUP_WINDOW_SECONDS)
+                        target, self.DEDUP_WINDOW_SECONDS)
             return False
-        space = self.chat.find_dm(target_email_or_resource)
+        # target is an email, a users/<id> resource, or a spaces/<id> directly.
+        space: Optional[str] = None
+        if target.startswith("spaces/"):
+            space = target
+        elif target.startswith("users/") or "@" in target:
+            cached = self._email_to_space.get(target.lower())
+            space = cached or self.chat.find_dm(target)
+            if space:
+                self._email_to_space[target.lower()] = space
         if not space:
-            logger.warning("could not resolve DM space for %s", target_email_or_resource)
+            logger.warning("could not resolve DM space for %s", target)
             self.bridge.send_prompt(
-                f"[[BRIDGE_NOTICE]] Could not open a DM to {target_email_or_resource}. "
-                f"They may need to message you first, or you may have the wrong address.",
+                f"[[BRIDGE_NOTICE]] Could not open a DM to {target}. Either we haven't "
+                f"shared a space, the email is wrong, or external chat isn't allowed.",
                 cancel_first=False,
             )
             return False
         try:
             for chunk in _chunk_message(text, limit=3500):
                 self.chat.post_message(space, chunk)
-            self._last_delivered[target_email_or_resource] = (text, time.time())
+            self._last_delivered[target] = (text, time.time())
             self._save_delivered()
-            logger.info("delivered chat DM to %s (%d chars)",
-                        target_email_or_resource, len(text))
+            logger.info("delivered chat DM to %s (%d chars)", target, len(text))
             return True
         except Exception:
-            logger.exception("failed to DM %s", target_email_or_resource)
+            logger.exception("failed to DM %s", target)
             return False
 
     def _post_channel(self, name_or_id: str, text: str) -> bool:
-        space = self._resolve_space(name_or_id)
+        space = self._resolve_space_name_or_id(name_or_id)
+        if not space and self.cfg.home_space and name_or_id.lower() in (
+                "home", "default", "general"):
+            space = self.cfg.home_space
         if not space:
             logger.warning("space not found: %s", name_or_id)
             self.bridge.send_prompt(
                 f"[[BRIDGE_CHANNEL_RESULT ok=false]] Could not find space "
-                f"'{name_or_id}'. Tell the user, or ask for the exact space name. "
-                f"Reply NOOP if no further action.",
+                f"'{name_or_id}'. Tell the user or ask for the exact name. NOOP if no action.",
                 cancel_first=False,
             )
             return False
         try:
             for chunk in _chunk_message(text, limit=3500):
                 self.chat.post_message(space, chunk)
-            logger.info("posted in space %s (%d chars)", space, len(text))
+            logger.info("posted to space %s (%d chars)", space, len(text))
             return True
         except Exception:
-            logger.exception("post_channel failed for %s", space)
+            logger.exception("failed to post to %s", space)
             return False
 
-    # ---- capture loop ----
+    # ---- threads ----
     def run_capture(self) -> None:
         time.sleep(3)
         while not self._stop.is_set():
@@ -737,80 +903,143 @@ class ChatListener:
                 logger.exception("capture loop error")
             time.sleep(2)
 
-    # ---- main entry ----
+    def run_poll(self) -> None:
+        time.sleep(5)
+        while not self._stop.is_set():
+            try:
+                self.poll_once()
+            except Exception:
+                logger.exception("poll loop error")
+            time.sleep(self.cfg.poll_seconds)
+
+    # ---- scheduled contacts: fire pending nudges ----
+    def run_schedule(self) -> None:
+        time.sleep(20)
+        while not self._stop.is_set():
+            try:
+                self._fire_due_contacts()
+            except Exception:
+                logger.exception("schedule loop error")
+            time.sleep(60)
+
+    def _fire_due_contacts(self) -> None:
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            rows = conn.execute(
+                "SELECT sc.id, sc.person_id, sc.reason, p.display_name, p.email "
+                "FROM scheduled_contacts sc JOIN people p ON p.id = sc.person_id "
+                "WHERE sc.status='pending' AND sc.fire_at <= datetime('now') "
+                "ORDER BY sc.fire_at ASC LIMIT 5"
+            ).fetchall()
+            for row in rows:
+                with conn:
+                    conn.execute(
+                        "UPDATE scheduled_contacts SET status='fired', fired_at=datetime('now') "
+                        "WHERE id=?", (row["id"],),
+                    )
+        finally:
+            conn.close()
+        for row in rows:
+            logger.info("firing scheduled_contact id=%s person=%s reason=%r",
+                        row["id"], row["display_name"], row["reason"])
+            prompt = (
+                f"[[BRIDGE_SCHEDULED_CONTACT person={row['display_name']} "
+                f"email={row['email']}]]\n"
+                f"  A self-scheduled follow-up has come due. Original reason:\n"
+                f"  {row['reason']}\n\n"
+                f"Decide: send a DM via [[COO_TO user_id={row['email']}]], chain another "
+                f"[[COO_NEXT_CONTACT user_id={row['email']} in_seconds=N reason=…]] if "
+                f"not yet time, or reply NOOP if nothing is needed."
+            )
+            with self._send_lock:
+                self.bridge.send_prompt(prompt, cancel_first=False)
+
+    # ---- google integration sync (Drive/Sheet/Docs mirror) ----
+    INTEGRATION_SYNC_SECONDS = 300   # 5 min
+
+    def run_integration_sync(self) -> None:
+        # Stagger start to not collide with first agent boot
+        time.sleep(45)
+        plugin = self._load_google_plugin()
+        if plugin is None:
+            logger.info("google plugin not installed — integration sync disabled")
+            return
+        while not self._stop.is_set():
+            try:
+                self._sync_google(plugin)
+            except Exception:
+                logger.exception("integration sync error")
+            for _ in range(self.INTEGRATION_SYNC_SECONDS):
+                if self._stop.is_set():
+                    return
+                time.sleep(1)
+
+    def _load_google_plugin(self):
+        path = (Path(__file__).resolve().parents[3]
+                / "integrations" / "google" / "plugin" / "__init__.py")
+        if not path.exists():
+            return None
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_int_google", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _sync_google(self, plugin) -> None:
+        creds_path = Path(
+            "/home/dan/.local/share/coo/tenants") / self.cfg.tenant_slug / "integrations" / "google" / "credentials.json"
+        if not creds_path.exists():
+            return
+        creds = json.loads(creds_path.read_text())
+        result = plugin.sync(str(self.cfg.tenant_db), "exec", creds)
+        if "creds_refreshed" in result:
+            rc = result.pop("creds_refreshed")
+            creds_path.write_text(json.dumps(rc, indent=2))
+            creds_path.chmod(0o600)
+        logger.info("google sync: %s", {k: v for k, v in result.items() if k != "creds_refreshed"})
+
     def run(self) -> None:
-        # First-start: spin up the agent and deliver the mission prompt.
         new_session = self.bridge.ensure_session()
         first_mark = self.cfg.state_dir / "first_start_done"
         if new_session or not first_mark.exists():
             ceo = person_by_email(self.cfg, self.cfg.ceo_email)
             ceo_name = ceo["display_name"] if ceo else self.cfg.ceo_email
-            prompt = chat_mission_prompt(
-                self.cfg, self.company, ceo_name, self.cfg.ceo_email,
-            )
+            prompt = chat_mission_prompt(self.cfg, self.company, ceo_name, self.cfg.ceo_email)
             with self._send_lock:
                 self.bridge.send_prompt(prompt, cancel_first=False)
             self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
             first_mark.write_text(str(int(time.time())))
             logger.info("sent initial mission prompt to agent")
         else:
-            # Bot restart on a live agent — prime so we don't re-dispatch the
-            # pre-restart reply, then deliver a short amendment.
             self.bridge.prime()
             with self._send_lock:
                 self.bridge.send_prompt(
                     "[[BRIDGE_NOTICE]] The Chat listener restarted. You are still "
-                    "connected; do NOT re-introduce yourself. Continue the conversation.",
+                    "connected; do NOT re-introduce yourself. Continue.",
                     cancel_first=False,
                 )
 
-        # Start capture loop in a background thread.
-        cap_t = threading.Thread(target=self.run_capture, daemon=True)
-        cap_t.start()
-
-        # Pub/Sub streaming pull (blocks until shutdown).
-        creds = service_account.Credentials.from_service_account_file(
-            str(self.cfg.sa_json),
-            scopes=["https://www.googleapis.com/auth/pubsub"],
-        )
-        subscriber = pubsub_v1.SubscriberClient(credentials=creds)
-        sub_path = subscriber.subscription_path(self.cfg.project_id, self.cfg.subscription)
-
-        def callback(message: pubsub_v1.subscriber.message.Message) -> None:
-            try:
-                evt = json.loads(message.data.decode("utf-8"))
-                self.handle_event(evt)
-                message.ack()
-            except Exception:
-                logger.exception("event handler failed; nack")
-                message.nack()
-
-        flow = pubsub_v1.types.FlowControl(max_messages=20)
-        future = subscriber.subscribe(sub_path, callback=callback, flow_control=flow)
-        logger.info("subscribed to %s — waiting for Chat events", sub_path)
+        threads = [
+            threading.Thread(target=self.run_capture, daemon=True, name="capture"),
+            threading.Thread(target=self.run_poll, daemon=True, name="poll"),
+            threading.Thread(target=self.run_schedule, daemon=True, name="schedule"),
+            threading.Thread(target=self.run_integration_sync, daemon=True, name="g-sync"),
+        ]
+        for t in threads:
+            t.start()
+        logger.info("polling every %ds; me=%s", self.cfg.poll_seconds, self.me_email)
 
         def _shutdown(signum, frame):
             logger.info("signal %s — shutting down", signum)
             self._stop.set()
-            future.cancel()
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
-
-        try:
-            future.result()
-        except (FuturesTimeoutError, KeyboardInterrupt):
-            pass
-        finally:
-            try:
-                subscriber.close()
-            except Exception:
-                pass
-            self._stop.set()
+        while not self._stop.is_set():
+            time.sleep(0.5)
+        for t in threads:
+            t.join(timeout=3)
 
 
-# ----------------------------------------------------------------------------
-# AgentBridge expects a discord-style Config (with .tmux_session, .workdir,
-# .run_ai, .agent_kind). We satisfy that shape with a duck-typed object.
 # ----------------------------------------------------------------------------
 class _DuckCfg:
     pass
@@ -825,15 +1054,13 @@ def _pretend_discord_cfg(cfg: Config) -> _DuckCfg:
     return d
 
 
-# ----------------------------------------------------------------------------
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     cfg = Config.from_env()
-    listener = ChatListener(cfg)
-    listener.run()
+    ChatListener(cfg).run()
 
 
 if __name__ == "__main__":
