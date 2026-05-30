@@ -165,7 +165,10 @@ class ChatAPI:
             user = user_resource_or_email
             if not user.startswith("users/"):
                 user = f"users/{user}"
-        url = f"{self.BASE}/spaces/findDirectMessage"
+        # Note the COLON in `spaces:findDirectMessage` — it's a Google API
+        # "custom verb", not a regular path segment. Using a slash returns
+        # "Missing or malformed space resource name".
+        url = f"{self.BASE}/spaces:findDirectMessage"
         resp = requests.get(url, headers=self._hdr(),
                             params={"name": user}, timeout=20)
         if resp.status_code == 200:
