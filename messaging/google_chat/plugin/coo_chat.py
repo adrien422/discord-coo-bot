@@ -205,10 +205,10 @@ class UserChatAPI:
                 return out
 
     def find_dm(self, user_ref: str) -> Optional[str]:
-        """Resolve a DM space name. `user_ref` may be an email or a `users/<id>`
-        resource — we wrap a bare email as `users/<email>` for the API."""
-        # `:findDirectMessage` is a Google API custom verb — colon, not slash.
+        """Find an EXISTING DM space with a user. Returns None if no DM has
+        ever been opened (use create_dm to initiate)."""
         name = user_ref if user_ref.startswith("users/") else f"users/{user_ref}"
+        # `:findDirectMessage` is a Google API custom verb — colon, not slash.
         url = f"{CHAT_BASE}/spaces:findDirectMessage"
         resp = requests.get(url, headers=self._hdr(),
                             params={"name": name}, timeout=20)
@@ -219,6 +219,30 @@ class UserChatAPI:
         logger.warning("findDirectMessage(%s) %d: %s", name, resp.status_code,
                        resp.text[:200])
         return None
+
+    def create_dm(self, user_ref: str) -> Optional[str]:
+        """Create (or return existing) 1:1 DM space with the given user.
+
+        Uses `spaces:setup`, which works for human-user OAuth (chat.spaces scope).
+        Lets Iris initiate cold DMs without needing the other person to message
+        her first — that limitation applies to Chat Apps, not human users.
+        """
+        name = user_ref if user_ref.startswith("users/") else f"users/{user_ref}"
+        url = f"{CHAT_BASE}/spaces:setup"
+        body = {
+            "space": {"spaceType": "DIRECT_MESSAGE"},
+            "memberships": [{"member": {"name": name, "type": "HUMAN"}}],
+        }
+        resp = requests.post(url, headers=self._hdr(), json=body, timeout=20)
+        if resp.status_code == 200:
+            return resp.json().get("name")
+        logger.warning("spaces:setup(%s) %d: %s", name, resp.status_code,
+                       resp.text[:300])
+        return None
+
+    def open_dm(self, user_ref: str) -> Optional[str]:
+        """Find an existing DM with the user, or create one."""
+        return self.find_dm(user_ref) or self.create_dm(user_ref)
 
     # ---- messages ----
     def list_messages(self, space: str, after_rfc3339: str,
@@ -847,7 +871,8 @@ class ChatListener:
             space = target
         elif target.startswith("users/") or "@" in target:
             cached = self._email_to_space.get(target.lower())
-            space = cached or self.chat.find_dm(target)
+            # open_dm = find existing DM, or create one if none exists yet.
+            space = cached or self.chat.open_dm(target)
             if space:
                 self._email_to_space[target.lower()] = space
         if not space:
@@ -1001,7 +1026,11 @@ class ChatListener:
     def run(self) -> None:
         new_session = self.bridge.ensure_session()
         first_mark = self.cfg.state_dir / "first_start_done"
-        if new_session or not first_mark.exists():
+        # First-start is determined by the persistent marker, NOT by whether
+        # tmux had to recreate the session. Otherwise a session kill causes
+        # the cold-intro mission to be re-sent, producing duplicate
+        # introductions to the CEO.
+        if not first_mark.exists():
             ceo = person_by_email(self.cfg, self.cfg.ceo_email)
             ceo_name = ceo["display_name"] if ceo else self.cfg.ceo_email
             prompt = chat_mission_prompt(self.cfg, self.company, ceo_name, self.cfg.ceo_email)
@@ -1011,13 +1040,38 @@ class ChatListener:
             first_mark.write_text(str(int(time.time())))
             logger.info("sent initial mission prompt to agent")
         else:
-            self.bridge.prime()
+            # Bot/agent restart on an existing tenant. Only prime() the pane
+            # dedup if we're attaching to an existing Claude (new_session=False);
+            # a brand-new pane has nothing to prime.
+            if not new_session:
+                self.bridge.prime()
             with self._send_lock:
-                self.bridge.send_prompt(
-                    "[[BRIDGE_NOTICE]] The Chat listener restarted. You are still "
-                    "connected; do NOT re-introduce yourself. Continue.",
-                    cancel_first=False,
-                )
+                self.bridge.send_prompt(self._restart_amendment(), cancel_first=False)
+            logger.info("sent restart amendment to agent")
+
+    def _restart_amendment(self) -> str:
+        """Compose the amendment delivered when the listener restarts on an
+        existing tenant. Includes a list of who's already been DM'd so the
+        agent doesn't re-cold-introduce after a session reset."""
+        prior_lines = []
+        for target, value in list(self._last_delivered.items())[:25]:
+            text = value[0] if isinstance(value, (list, tuple)) else value
+            preview = text.replace("\n", " ")[:80]
+            prior_lines.append(f"  - {target}: \"{preview}…\"")
+        prior = ("PRIOR DELIVERIES (from your earlier session — do NOT cold-intro "
+                 "to any of these people again; pick up the conversation as it "
+                 "stood):\n" + "\n".join(prior_lines) + "\n\n") if prior_lines else ""
+        return (
+            "[[BRIDGE_NOTICE]] The Chat listener restarted. You are still "
+            "connected; do NOT re-introduce yourself to anyone you've already "
+            "DM'd. Continue the conversation in-place.\n\n"
+            + prior +
+            "SCHEDULING — [[COO_NEXT_CONTACT user_id=<email> in_seconds=N "
+            "reason=R]] is your ONLY real scheduling mechanism (ScheduleWakeup "
+            "/ Cron* do nothing). Any 'I'll follow up in N hours' MUST emit a "
+            "[[COO_NEXT_CONTACT]] in the same reply.\n\n"
+            "Reply NOOP and resume."
+        )
 
         threads = [
             threading.Thread(target=self.run_capture, daemon=True, name="capture"),

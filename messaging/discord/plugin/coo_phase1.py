@@ -489,12 +489,22 @@ class AgentBridge:
             == 0
         )
 
+    # Max bytes per `tmux send-keys -l` invocation. The Linux ARG_MAX is
+    # much higher, but in practice tmux/argv layering rejects anywhere from
+    # ~16KB and above with non-zero exit. Stay well under it.
+    _PASTE_CHUNK = 3500
+
     def send_prompt(self, text: str, cancel_first: bool = False) -> None:
         """Type text into the agent pane and submit it.
 
         Claude Code uses bracketed-paste mode; sending Enter immediately after
         a multi-line paste gets absorbed by the paste sequence. We send the
         text, sleep, send Enter (closes paste), sleep, send Enter (submits).
+
+        Long texts (e.g. the 17KB initial mission) are split into
+        `_PASTE_CHUNK`-byte chunks and sent in sequence — a single
+        `send-keys -l` of the whole string fails for sufficiently large
+        payloads, which silently broke first-start mission delivery.
 
         cancel_first=True sends Escape first to cancel any modal/partial input.
         Use ONLY for top-level interrupting events (initial mission). Avoid
@@ -509,10 +519,17 @@ class AgentBridge:
                 timeout=5, check=False,
             )
             time.sleep(0.15)
-        subprocess.run(
-            ["tmux", "send-keys", "-t", self._target, "-l", text],
-            timeout=20, check=True,
-        )
+        # Chunked paste. Each chunk is a separate `-l` invocation; tmux
+        # accumulates them in the bracketed-paste buffer until we send Enter.
+        for i in range(0, len(text), self._PASTE_CHUNK):
+            chunk = text[i:i + self._PASTE_CHUNK]
+            subprocess.run(
+                ["tmux", "send-keys", "-t", self._target, "-l", chunk],
+                timeout=20, check=True,
+            )
+            # Tiny gap between chunks so tmux's input ring doesn't drop bytes.
+            if len(text) - i > self._PASTE_CHUNK:
+                time.sleep(0.05)
         time.sleep(0.4)
         subprocess.run(
             ["tmux", "send-keys", "-t", self._target, "Enter"],
@@ -1759,14 +1776,22 @@ class COOBot(discord.Client):
             logger.error("No CEO row in tenant DB. Cannot proceed.")
             return
 
-        if self._session_was_new:
-            # Fresh tmux + agent. Send full mission, mark first start.
+        # A "true" first start is determined by the persistent marker, NOT
+        # by whether tmux had to recreate the session. If the marker exists
+        # we've already cold-introduced to the CEO before — taking the
+        # initial-mission path again would tell the agent to re-introduce
+        # itself, producing duplicate cold-DMs (the symptom that bit this
+        # tenant on a tmux-session restart).
+        if not self.first_start_marker.exists():
             await self._send_initial_mission()
             self.first_start_marker.write_text(str(int(time.time())))
         else:
-            # Bot restarted but agent is still alive. Prime dedup so we
-            # don't re-deliver the last response, then send an amendment.
-            await asyncio.to_thread(self.bridge.prime)
+            # Bot restarted (and/or tmux session was recreated). Prime dedup
+            # so we don't re-deliver the last response, then send an amendment
+            # that includes prior delivery state so the agent doesn't repeat
+            # cold intros.
+            if not self._session_was_new:
+                await asyncio.to_thread(self.bridge.prime)
             await self._send_amendment()
 
         self._capture_task = asyncio.create_task(self._capture_loop())
@@ -1788,11 +1813,33 @@ class COOBot(discord.Client):
         # state. The trust gate is handled in ensure_session().
         await self._send_to_agent(prompt, cancel_first=False)
 
+    def _already_dmd_block(self) -> str:
+        """Compose a short "you've already DM'd these people" block from
+        delivered.json so the agent doesn't re-introduce after a restart that
+        wiped its in-pane memory (e.g. when the tmux session was killed)."""
+        if not self._last_delivered:
+            return ""
+        lines = []
+        for uid, value in list(self._last_delivered.items())[:25]:
+            # delivered.json values can be the new (text, ts) tuple form or
+            # the legacy bare-string form.
+            text = value[0] if isinstance(value, (list, tuple)) else value
+            preview = text.replace("\n", " ")[:80]
+            lines.append(f"  - user_id={uid}: \"{preview}…\"")
+        return (
+            "PRIOR DELIVERIES (from your earlier session — do NOT cold-intro "
+            "to any of these people again; pick up the conversation as it "
+            "stood):\n" + "\n".join(lines) + "\n\n"
+        )
+
     async def _send_amendment(self) -> None:
         """Send a short guidance update when the bot restarts on a live agent."""
+        prior = self._already_dmd_block()
         amendment = (
             "[[BRIDGE_NOTICE]] The Discord listener restarted. You are still "
-            "connected; do NOT re-introduce yourself. Continue the conversation.\n\n"
+            "connected; do NOT re-introduce yourself to anyone you've already "
+            "DM'd. Continue the conversation in-place.\n\n"
+            + prior +
             "MODEL UPDATE (replaces the previous notice):\n"
             "  - Gate for inbound DMs = ORG CHART membership (people table).\n"
             "  - In-org-chart DMs reach you in real time, weighted by role.\n"
