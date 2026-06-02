@@ -786,6 +786,17 @@ class ChatListener:
             self._save_poll_state()
         return n
 
+    def _mentions_me(self, msg: dict) -> bool:
+        """True if the message explicitly @mentions Iris. Google Chat encodes
+        mentions in `annotations` (type USER_MENTION) with the mentioned user's
+        resource name."""
+        for ann in msg.get("annotations", []) or []:
+            if ann.get("type") == "USER_MENTION":
+                u = ((ann.get("userMention") or {}).get("user") or {}).get("name", "")
+                if u == self.me_user:
+                    return True
+        return False
+
     def _handle_message(self, space: dict, msg: dict) -> None:
         sender = msg.get("sender") or {}
         email = (sender.get("email") or "").lower()
@@ -795,9 +806,23 @@ class ChatListener:
         if not text.strip():
             return
 
-        # Cache email <-> space (so we know how to DM them back)
         space_name = space.get("name") or ""
-        if email and space.get("type") == "DIRECT_MESSAGE":
+        space_type = space.get("type") or space.get("spaceType") or ""
+        is_dm = space_type == "DIRECT_MESSAGE"
+
+        # Iris is a MEMBER of group spaces (e.g. "General"), so the poller sees
+        # every message posted there — including people talking to each other,
+        # not to her. Acting on those produced the bug where she replied to a
+        # message Naim meant for someone else. Rule: only engage on 1:1 DMs, or
+        # group-space messages that explicitly @mention her. Everything else in
+        # a group space is ambient context and is ignored.
+        if not is_dm and not self._mentions_me(msg):
+            logger.info("ambient msg in group space %s from %s — ignoring (not @mentioned)",
+                        space.get("displayName") or space_name, display)
+            return
+
+        # Cache email <-> space (so we know how to DM them back)
+        if email and is_dm:
             self._email_to_space[email] = space_name
 
         # Person lookup — try Chat user_id first, then email (often hidden).
