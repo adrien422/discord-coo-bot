@@ -716,6 +716,44 @@ class ChatListener:
             self._email_to_space[e] = space
         return space
 
+    def _email_for_dm_space(self, space_name: str) -> Optional[str]:
+        """Reverse a DM space back to the known email it belongs to.
+
+        Tries the in-memory cache first, then asks the Chat API for each known
+        person/developer's DM space and matches. Lets us identify a sender whose
+        email Chat withheld and whose chat_user_id we haven't recorded yet —
+        the person Iris cold-DM'd but who is replying for the first time.
+        """
+        # 1. cached forward map
+        for em, sp in self._email_to_space.items():
+            if sp == space_name:
+                return em
+        # 2. resolve each candidate email's DM space and compare
+        candidates: list[str] = []
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            for r in conn.execute(
+                "SELECT email FROM people WHERE email IS NOT NULL AND deleted_at IS NULL"
+            ).fetchall():
+                candidates.append(r["email"])
+        finally:
+            conn.close()
+        pconn = _connect(self.cfg.platform_db)
+        try:
+            for r in pconn.execute(
+                "SELECT email FROM developers WHERE email IS NOT NULL"
+            ).fetchall():
+                candidates.append(r["email"])
+        finally:
+            pconn.close()
+        for em in candidates:
+            sp = self.chat.find_dm(em)
+            if sp:
+                self._email_to_space[em.lower()] = sp
+                if sp == space_name:
+                    return em.lower()
+        return None
+
     # ---- inbound: poll once ----
     def poll_once(self) -> int:
         """Pull new messages from every space and dispatch. Returns count."""
@@ -772,6 +810,27 @@ class ChatListener:
             upsert_chat_user_id(self.cfg, person["id"], user_resource)
 
         dev = developer_lookup(self.cfg, user_resource, email)
+
+        # Reverse-resolve: Chat hides the sender email, and a person who has
+        # only ever been DM'd (never replied) has a NULL google_chat_user_id —
+        # so neither lookup matches and they look like a stranger. If this is a
+        # DM space, map it back to the email Iris used to open it, identify the
+        # person, and backfill their chat_user_id so all future messages match.
+        if not person and not dev and user_resource \
+                and space.get("type") == "DIRECT_MESSAGE":
+            resolved_email = self._email_for_dm_space(space_name)
+            if resolved_email:
+                person = person_by_email(self.cfg, resolved_email)
+                if person:
+                    upsert_chat_user_id(self.cfg, person["id"], user_resource)
+                    email = resolved_email
+                    logger.info("reverse-resolved %s in %s -> %s (backfilled chat id)",
+                                user_resource, space_name, resolved_email)
+                else:
+                    dev = developer_lookup(self.cfg, None, resolved_email)
+                    if dev:
+                        email = resolved_email
+
         if not person and not dev:
             logger.info("msg from %s <%s/%s> in %s — not in org chart, not a developer — ignoring",
                         display, email, user_resource, space_name)
@@ -1049,6 +1108,26 @@ class ChatListener:
                 self.bridge.send_prompt(self._restart_amendment(), cancel_first=False)
             logger.info("sent restart amendment to agent")
 
+        threads = [
+            threading.Thread(target=self.run_capture, daemon=True, name="capture"),
+            threading.Thread(target=self.run_poll, daemon=True, name="poll"),
+            threading.Thread(target=self.run_schedule, daemon=True, name="schedule"),
+            threading.Thread(target=self.run_integration_sync, daemon=True, name="g-sync"),
+        ]
+        for t in threads:
+            t.start()
+        logger.info("polling every %ds; me=%s", self.cfg.poll_seconds, self.me_email)
+
+        def _shutdown(signum, frame):
+            logger.info("signal %s — shutting down", signum)
+            self._stop.set()
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+        while not self._stop.is_set():
+            time.sleep(0.5)
+        for t in threads:
+            t.join(timeout=3)
+
     def _restart_amendment(self) -> str:
         """Compose the amendment delivered when the listener restarts on an
         existing tenant. Includes a list of who's already been DM'd so the
@@ -1072,26 +1151,6 @@ class ChatListener:
             "[[COO_NEXT_CONTACT]] in the same reply.\n\n"
             "Reply NOOP and resume."
         )
-
-        threads = [
-            threading.Thread(target=self.run_capture, daemon=True, name="capture"),
-            threading.Thread(target=self.run_poll, daemon=True, name="poll"),
-            threading.Thread(target=self.run_schedule, daemon=True, name="schedule"),
-            threading.Thread(target=self.run_integration_sync, daemon=True, name="g-sync"),
-        ]
-        for t in threads:
-            t.start()
-        logger.info("polling every %ds; me=%s", self.cfg.poll_seconds, self.me_email)
-
-        def _shutdown(signum, frame):
-            logger.info("signal %s — shutting down", signum)
-            self._stop.set()
-        signal.signal(signal.SIGTERM, _shutdown)
-        signal.signal(signal.SIGINT, _shutdown)
-        while not self._stop.is_set():
-            time.sleep(0.5)
-        for t in threads:
-            t.join(timeout=3)
 
 
 # ----------------------------------------------------------------------------
