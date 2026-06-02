@@ -807,8 +807,12 @@ class ChatListener:
             return
 
         space_name = space.get("name") or ""
-        space_type = space.get("type") or space.get("spaceType") or ""
-        is_dm = space_type == "DIRECT_MESSAGE"
+        # Distinguish 1:1 DMs from group spaces. The legacy `type` field returns
+        # "ROOM" for BOTH, so it's useless here — `spaceType` is authoritative
+        # ("DIRECT_MESSAGE" vs "SPACE"/"GROUP_CHAT"). Fall back to legacy `type`
+        # == "DM" only if spaceType is absent.
+        is_dm = (space.get("spaceType") == "DIRECT_MESSAGE"
+                 or (not space.get("spaceType") and space.get("type") == "DM"))
 
         # Iris is a MEMBER of group spaces (e.g. "General"), so the poller sees
         # every message posted there — including people talking to each other,
@@ -822,7 +826,7 @@ class ChatListener:
             return
 
         # Cache email <-> space (so we know how to DM them back)
-        if email and is_dm:
+        if email and is_dm and space_name:
             self._email_to_space[email] = space_name
 
         # Person lookup — try Chat user_id first, then email (often hidden).
@@ -841,8 +845,7 @@ class ChatListener:
         # so neither lookup matches and they look like a stranger. If this is a
         # DM space, map it back to the email Iris used to open it, identify the
         # person, and backfill their chat_user_id so all future messages match.
-        if not person and not dev and user_resource \
-                and space.get("type") == "DIRECT_MESSAGE":
+        if not person and not dev and user_resource and is_dm:
             resolved_email = self._email_for_dm_space(space_name)
             if resolved_email:
                 person = person_by_email(self.cfg, resolved_email)
@@ -883,13 +886,13 @@ class ChatListener:
             self._last_asserter_pid = person["id"]
             channel_id = ensure_channel(
                 self.cfg, space.get("displayName") or display, space_name,
-                kind="dm" if space.get("type") == "DIRECT_MESSAGE" else "general",
+                kind="dm" if is_dm else "general",
             )
             interview_id = ensure_interview(self.cfg, person["id"], channel_id)
             append_transcript(self.cfg, interview_id, "user", display, text)
         else:
             # Cache DM space for outbound replies to this developer.
-            if email and space.get("type") == "DIRECT_MESSAGE":
+            if email and is_dm:
                 self._email_to_space[email] = space_name
 
         # Include user_id so the agent can address by Chat resource if email
