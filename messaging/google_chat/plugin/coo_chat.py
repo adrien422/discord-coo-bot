@@ -281,6 +281,31 @@ class UserChatAPI:
             raise RuntimeError(f"post {space} {resp.status_code}: {resp.text[:300]}")
         return resp.json()
 
+    def download_attachment(self, resource_name: str, dest: Path) -> bool:
+        """Download a Chat message attachment (uploaded media) to `dest`.
+        `resource_name` is attachment.attachmentDataRef.resourceName."""
+        url = f"{CHAT_BASE}/media/{resource_name}?alt=media"
+        resp = requests.get(url, headers={"Authorization": f"Bearer {self._ensure_token()}"},
+                            timeout=60)
+        if resp.status_code != 200:
+            logger.warning("attachment download %d: %s", resp.status_code, resp.text[:200])
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(resp.content)
+        return True
+
+    def download_drive_attachment(self, file_id: str, dest: Path) -> bool:
+        """Download a Drive-backed Chat attachment via the Drive API."""
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
+        resp = requests.get(url, headers={"Authorization": f"Bearer {self._ensure_token()}"},
+                            params={"alt": "media"}, timeout=60)
+        if resp.status_code != 200:
+            logger.warning("drive attachment download %d: %s", resp.status_code, resp.text[:200])
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(resp.content)
+        return True
+
 
 # ----------------------------------------------------------------------------
 # Tenant DB helpers (same as before, copied/adapted)
@@ -525,6 +550,124 @@ def record_commitment(cfg: Config, who: str, description: str,
         conn.close()
 
 
+def ensure_team(cfg: Config, slug: str, name: Optional[str] = None) -> Optional[int]:
+    if not slug:
+        return None
+    conn = _connect(cfg.tenant_db)
+    try:
+        row = conn.execute("SELECT id FROM teams WHERE slug = ?", (slug,)).fetchone()
+        if row:
+            return row["id"]
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO teams (slug, name) VALUES (?, ?)",
+                (slug, name or slug.replace("-", " ").title()),
+            )
+            return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def record_person_add(cfg: Config, fields: dict) -> None:
+    """Add/update a person from a COO_PERSON_ADD marker. Chat-flavoured:
+    user_id is an email (the durable Chat handle is backfilled when they
+    first message). Idempotent on email."""
+    email = (fields.get("user_id") or fields.get("email") or "").strip().lower()
+    name = fields.get("name") or email
+    role = fields.get("role")
+    team_slug = fields.get("team")
+    tier = fields.get("access_tier") or "employee"
+    if tier not in ("admin", "strategic", "manager", "employee"):
+        tier = "employee"
+    if not email or "@" not in email:
+        logger.warning("person_add without a valid email: %r — skipped", fields)
+        return
+    team_id = ensure_team(cfg, team_slug) if team_slug else None
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or email.split("@")[0]).lower()).strip("-")
+    conn = _connect(cfg.tenant_db)
+    try:
+        existing = conn.execute(
+            "SELECT id FROM people WHERE LOWER(email) = LOWER(?)", (email,)
+        ).fetchone()
+        with conn:
+            if existing:
+                conn.execute(
+                    "UPDATE people SET display_name=?, role=?, team_id=COALESCE(?, team_id), "
+                    "access_tier=?, deleted_at=NULL, updated_at=datetime('now') WHERE id=?",
+                    (name, role, team_id, tier, existing["id"]),
+                )
+                logger.info("person updated: %s (%s)", name, email)
+            else:
+                # slug uniqueness guard
+                n, base = 1, slug
+                while conn.execute("SELECT 1 FROM people WHERE slug=?", (slug,)).fetchone():
+                    n += 1; slug = f"{base}-{n}"
+                conn.execute(
+                    "INSERT INTO people (slug, display_name, email, role, team_id, access_tier) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (slug, name, email, role, team_id, tier),
+                )
+                logger.info("person added: %s (%s, tier=%s)", name, email, tier)
+    finally:
+        conn.close()
+
+
+def record_workflow(cfg: Config, fields: dict) -> None:
+    slug = fields.get("slug")
+    if not slug:
+        return
+    name = fields.get("name") or slug
+    desc = fields.get("description")
+    cadence = fields.get("cadence")
+    team_id = ensure_team(cfg, fields["owner_team"]) if fields.get("owner_team") else None
+    conn = _connect(cfg.tenant_db)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO workflows (slug, name, description, owner_team_id, cadence) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(slug) DO UPDATE SET name=excluded.name, "
+                "  description=excluded.description, owner_team_id=excluded.owner_team_id, "
+                "  cadence=excluded.cadence, updated_at=datetime('now')",
+                (slug, name, desc, team_id, cadence),
+            )
+        logger.info("workflow upserted: %s", slug)
+    finally:
+        conn.close()
+
+
+def record_task(cfg: Config, fields: dict) -> None:
+    title = fields.get("title")
+    if not title:
+        return
+    owner_email = (fields.get("owner_person_id") or "").strip().lower()
+    owner_pid = None
+    if owner_email and "@" in owner_email:
+        kind, sid = _resolve_subject(cfg, owner_email)
+        owner_pid = sid if kind == "person" else None
+    team_id = ensure_team(cfg, fields["owner_team"]) if fields.get("owner_team") else None
+    status = fields.get("status") or "pending"
+    if status not in ("pending", "active", "blocked", "done", "dropped"):
+        status = "pending"
+    conn = _connect(cfg.tenant_db)
+    try:
+        dup = conn.execute(
+            "SELECT id FROM tasks WHERE title=? AND created_at > datetime('now','-300 seconds')",
+            (title,)).fetchone()
+        if dup:
+            return
+        with conn:
+            conn.execute(
+                "INSERT INTO tasks (title, description, owner_person_id, owner_team_id, "
+                "  status, due_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (title, fields.get("description"), owner_pid, team_id, status,
+                 fields.get("due")),
+            )
+        logger.info("task recorded: %s", title)
+    finally:
+        conn.close()
+
+
 def record_decision(cfg: Config, title: str, body: str, rationale: Optional[str],
                     scope: Optional[str], interview_id: Optional[int]) -> None:
     scope_kind: Optional[str] = None
@@ -547,6 +690,11 @@ def record_decision(cfg: Config, title: str, body: str, rationale: Optional[str]
 # ----------------------------------------------------------------------------
 # Mission prompt
 # ----------------------------------------------------------------------------
+def _tools_path() -> str:
+    """Absolute path to the google_tools.py CLI the agent shells out to."""
+    return str(Path(__file__).resolve().parent.parent / "google_tools.py")
+
+
 def chat_mission_prompt(cfg: Config, company: str, ceo_name: str, ceo_email: str) -> str:
     return f"""You are **{cfg.coo_name}**, the persistent COO agent for **{company}**.
 
@@ -583,6 +731,37 @@ To post in a space:
     [[COO_CHANNEL name=<space-name>]] <text>
 
 (or `id=<spaces/AAA>`). Failure comes back as [[BRIDGE_CHANNEL_RESULT ok=false]].
+
+# Your Google Workspace access (you DO have it)
+
+You are signed in as a real Google account ({cfg.coo_name} @ projectbyall.com)
+with full Workspace scopes. You can read and act on Gmail, Sheets, Docs,
+Drive, Calendar, and Tasks — via a CLI helper. Run it from your shell:
+
+    python3 {_tools_path()} <command> [args]
+
+Commands:
+  gmail-list [--query Q] [--max N]            — list recent emails
+  gmail-read <message_id>                     — full body of one email
+  gmail-send --to A --subject S --body B      — SEND an email (you CAN email)
+  sheets-read <spreadsheet_id> <A1range>      — read sheet cells
+  sheets-append <spreadsheet_id> <tab> --row "a,b,c"
+  doc-read <document_id>                      — read a Google Doc
+  drive-list [--query Q] [--max N]            — list Drive files
+  drive-read <file_id>                        — read/export a Drive file
+  calendar-list [--max N]                     — upcoming events
+  tasks-list                                  — your task lists
+
+So when someone says "I'll email it to you" — YES, you can receive email:
+run `gmail-list` to find it and `gmail-read` to read it. Never tell someone
+you have no inbox or can't do email; you can.
+
+# Reading attachments people send you
+
+When a Chat message includes a file, the bridge downloads it and appends an
+ATTACHMENTS block with local file paths to the incoming message. Open them
+with your Read tool (PDF, CSV, images, text — all readable). Don't claim you
+can't see an attachment; check for the ATTACHMENTS block and Read the path.
 
 # Self-pacing — your ONLY real scheduling mechanism
 
@@ -895,17 +1074,59 @@ class ChatListener:
             if email and is_dm:
                 self._email_to_space[email] = space_name
 
+        # Download any attachments to disk so the agent can Read them.
+        att_block = self._save_attachments(msg, interview_id)
+
         # Include user_id so the agent can address by Chat resource if email
         # is somehow ambiguous later. Email is the natural reply key.
         prompt = (
             f"[[INCOMING_DM from={display} email={email or '(unknown)'} "
             f"user_id={user_resource or '(unknown)'} role={role_label}]]\n\n"
-            f"  {text}\n\n"
+            f"  {text or '(no text)'}\n\n"
+            + att_block +
             f"Respond as the persistent COO agent. Use `[[COO_TO user_id={email or user_resource}]]` "
             f"to reply (use the exact email above — do NOT guess). Plain text is internal notes only."
         )
         with self._send_lock:
             self.bridge.send_prompt(prompt, cancel_first=False)
+
+    def _save_attachments(self, msg: dict, interview_id: Optional[int]) -> str:
+        """Download every attachment on a message to the tenant's attachments/
+        dir and return a prompt block listing the local paths, so the agent can
+        open them with its Read tool. Empty string if no attachments."""
+        atts = msg.get("attachment") or msg.get("attachments") or []
+        if not atts:
+            return ""
+        msg_id = (msg.get("name") or "msg").split("/")[-1].split(".")[0]
+        base = self.cfg.state_dir.parent / "attachments" / msg_id
+        saved: list[str] = []
+        for i, att in enumerate(atts):
+            cname = att.get("contentName") or f"attachment_{i}"
+            ctype = att.get("contentType") or "application/octet-stream"
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", cname)
+            dest = base / safe
+            ok = False
+            data_ref = att.get("attachmentDataRef") or {}
+            drive_ref = att.get("driveDataRef") or {}
+            try:
+                if data_ref.get("resourceName"):
+                    ok = self.chat.download_attachment(data_ref["resourceName"], dest)
+                elif drive_ref.get("driveFileId"):
+                    ok = self.chat.download_drive_attachment(drive_ref["driveFileId"], dest)
+            except Exception:
+                logger.exception("attachment download failed: %s", cname)
+            if ok:
+                saved.append(f"  - {cname} ({ctype}) -> {dest}")
+                logger.info("saved attachment %s -> %s", cname, dest)
+            else:
+                saved.append(f"  - {cname} ({ctype}) -> DOWNLOAD FAILED")
+        if not saved:
+            return ""
+        return (
+            "ATTACHMENTS on this message (already downloaded to disk — open them "
+            "with your Read tool; for a CSV/PDF/image just Read the path):\n"
+            + "\n".join(saved) + "\n\n"
+        )
 
     # ---- outbound: dispatch agent reply ----
     def dispatch_response(self, response: str) -> None:
@@ -942,6 +1163,12 @@ class ChatListener:
         for m in CHAT_NEXT_CONTACT_RE.finditer(response):
             who, secs, reason = m.group(1), int(m.group(2)), m.group(3).strip()
             record_scheduled_contact(self.cfg, who, secs, reason)
+        for m in COO_PERSON_ADD_RE.finditer(response):
+            record_person_add(self.cfg, _parse_kv(m.group(1)))
+        for m in COO_WORKFLOW_RE.finditer(response):
+            record_workflow(self.cfg, _parse_kv(m.group(1)))
+        for m in COO_TASK_RE.finditer(response):
+            record_task(self.cfg, _parse_kv(m.group(1)))
 
         if not sent_any and "NOOP" not in response.upper():
             logger.debug("agent reply had no actionable markers")
