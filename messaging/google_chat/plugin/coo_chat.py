@@ -732,29 +732,36 @@ To post in a space:
 
 (or `id=<spaces/AAA>`). Failure comes back as [[BRIDGE_CHANNEL_RESULT ok=false]].
 
-# Your Google Workspace access (you DO have it)
+# Communication channel — GOOGLE CHAT ONLY
 
-You are signed in as a real Google account ({cfg.coo_name} @ projectbyall.com)
-with full Workspace scopes. You can read and act on Gmail, Sheets, Docs,
-Drive, Calendar, and Tasks — via a CLI helper. Run it from your shell:
+You talk to people ONLY through Google Chat (via the [[COO_TO]] / [[COO_CHANNEL]]
+markers). This is a hard rule. NEVER email a person as a way to reach them,
+even if their Chat DM fails. If someone isn't reachable on Chat, report it to
+the CEO (Naim) and developer (Ivan) so they enable Chat for that person — do
+NOT route around it by email.
+
+# Your Google Workspace access — for READING DATA, not messaging
+
+You are signed in as a real Google account ({cfg.coo_name}) with Workspace
+scopes. Use these to READ and REFERENCE data only — they are NOT a way to
+contact people:
 
     python3 {_tools_path()} <command> [args]
 
-Commands:
-  gmail-list [--query Q] [--max N]            — list recent emails
-  gmail-read <message_id>                     — full body of one email
-  gmail-send --to A --subject S --body B      — SEND an email (you CAN email)
-  sheets-read <spreadsheet_id> <A1range>      — read sheet cells
+  gmail-list [--query Q] [--max N]      — read your own inbox (e.g. find a doc
+                                          someone emailed you for reference)
+  gmail-read <message_id>               — read one email's contents
+  sheets-read <spreadsheet_id> <range>  — read sheet cells
   sheets-append <spreadsheet_id> <tab> --row "a,b,c"
-  doc-read <document_id>                      — read a Google Doc
-  drive-list [--query Q] [--max N]            — list Drive files
-  drive-read <file_id>                        — read/export a Drive file
-  calendar-list [--max N]                     — upcoming events
-  tasks-list                                  — your task lists
+  doc-read <document_id>                — read a Google Doc
+  drive-list [--query Q] [--max N]      — list Drive files
+  drive-read <file_id>                  — read/export a Drive file
+  calendar-list [--max N]               — upcoming events
+  tasks-list                            — task lists
 
-So when someone says "I'll email it to you" — YES, you can receive email:
-run `gmail-list` to find it and `gmail-read` to read it. Never tell someone
-you have no inbox or can't do email; you can.
+You may READ an email someone sends you (gmail-read) — but you reply and follow
+up in Google Chat, never by sending email. Do not use gmail-send to contact a
+person.
 
 # Reading attachments people send you
 
@@ -1197,10 +1204,12 @@ class ChatListener:
         for t, r in bad:
             lines.append(f"FAILED: {t} — {r}")
         lines.append(
-            "For anyone unreachable on Chat, you DO have email: send via "
-            "`python3 " + _tools_path() + " gmail-send --to <email> --subject S "
-            "--body B`. Use it for the FAILED recipients, or tell Naim they're "
-            "not on Chat. Reply NOOP if nothing else is needed.")
+            "Google Chat is your ONLY communication channel. Do NOT email people "
+            "as a workaround — email is for reading/reference data only, never for "
+            "contacting a person. If someone is unreachable on Chat, do NOT keep "
+            "retrying and do NOT pretend you reached them: report it to the CEO "
+            "(Naim) and the developer (Ivan) so they can enable Chat for that "
+            "person or give you the right handle. Reply NOOP if nothing else is needed.")
         with self._send_lock:
             self.bridge.send_prompt("\n".join(lines), cancel_first=False)
 
