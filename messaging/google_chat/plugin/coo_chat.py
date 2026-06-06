@@ -81,6 +81,8 @@ CHAT_COMMITMENT_RE = re.compile(
 CHAT_NEXT_CONTACT_RE = re.compile(
     r'\[\[COO_NEXT_CONTACT\s+user_id="?([^"\s]+)"?\s+in_seconds=(\d+)\s+reason=([^\]]+)\]\]'
 )
+# A developer DM containing "approve phase N" unlocks phase N.
+PHASE_APPROVAL_RE = re.compile(r"\bapprove\s+phase\s+([2-9])\b", re.I)
 
 
 # ----------------------------------------------------------------------------
@@ -806,6 +808,33 @@ tools do NOTHING here — only this marker actually re-pings someone.
 
 Track progress as internal notes (plain text, no [[COO_TO]] prefix).
 
+# Reaching a NEW person (Google Chat limitation)
+
+You can only message someone once they have opened a chat with you. The FIRST
+contact must come from them. So to bring a new person in:
+  1. Send your [[COO_TO user_id=<email>]] as normal.
+  2. If the bridge reports it FAILED, that person hasn't opened a chat yet.
+     Do NOT retry and do NOT claim you reached them.
+  3. DM the developer Ivan (ivan@projectbyall.com): name the person(s) and ask
+     him to have each send you a quick "hi" so the channel opens.
+  4. Once they've said hi (the bridge will start delivering to them), message
+     them for real.
+This is the ONLY way to onboard a new contact. Never route around it by email.
+
+# Phases and the Phase-2 gate
+
+Phase 1 = map the company with the CEO (you're doing this now). Phase 2 =
+interview the MANAGERS one by one. Phase 2 is LOCKED until a developer
+approves it — you cannot start interviewing managers on your own.
+
+When Phase 1 is complete (every checklist box filled, CEO confirmed), DM the
+developer Ivan (ivan@projectbyall.com) a Phase-2 proposal: the list of
+managers to interview and the order you'd take them in, and ask him to
+approve. A developer message containing "approve phase 2" unlocks it — the
+bridge confirms with a [[BRIDGE_PHASE_UNLOCKED phase=2]] notice. Only after
+that notice may you start DMing managers for interviews. Do not interview
+managers before the unlock.
+
 # Recording what you learn
 
   - [[COO_FACT subject="<email|company|team-slug>" predicate="<pred>" object="<val>"]]
@@ -1089,6 +1118,23 @@ class ChatListener:
             if email and is_dm:
                 self._email_to_space[email] = space_name
 
+        # Developer "approve phase N" → unlock the phase in platform.tenants.
+        phase_block = ""
+        if dev:
+            pm = PHASE_APPROVAL_RE.search(text)
+            if pm:
+                new_phase = int(pm.group(1))
+                if self._unlock_phase(new_phase, email or display):
+                    logger.info("phase advanced to %d by %s", new_phase, email)
+                    phase_block = (
+                        f"[[BRIDGE_PHASE_UNLOCKED phase={new_phase}]] Developer "
+                        f"{display} approved Phase {new_phase}. You may now do "
+                        f"Phase {new_phase} work (e.g. interview the managers).\n\n")
+                else:
+                    phase_block = (
+                        f"[[BRIDGE_NOTICE]] Phase {new_phase} was already unlocked "
+                        f"(or not higher than current). No change.\n\n")
+
         # Download any attachments to disk so the agent can Read them.
         att_block = self._save_attachments(msg, interview_id)
 
@@ -1098,7 +1144,7 @@ class ChatListener:
             f"[[INCOMING_DM from={display} email={email or '(unknown)'} "
             f"user_id={user_resource or '(unknown)'} role={role_label}]]\n\n"
             f"  {text or '(no text)'}\n\n"
-            + att_block +
+            + phase_block + att_block +
             f"Respond as the persistent COO agent. Use `[[COO_TO user_id={email or user_resource}]]` "
             f"to reply (use the exact email above — do NOT guess). Plain text is internal notes only."
         )
@@ -1197,6 +1243,28 @@ class ChatListener:
         if not sent_any and "NOOP" not in response.upper():
             logger.debug("agent reply had no actionable markers")
 
+    def _unlock_phase(self, new_phase: int, approver: str) -> bool:
+        """Bump tenant phase in platform.tenants if new_phase is higher. Returns
+        True if a change was made."""
+        pconn = _connect(self.cfg.platform_db)
+        try:
+            row = pconn.execute(
+                "SELECT id, phase FROM tenants WHERE slug = ?", (self.cfg.tenant_slug,)
+            ).fetchone()
+            if not row or row["phase"] >= new_phase:
+                return False
+            with pconn:
+                pconn.execute("UPDATE tenants SET phase = ? WHERE id = ?",
+                              (new_phase, row["id"]))
+                pconn.execute(
+                    "INSERT INTO platform_audit (action, tenant_id, payload_json) "
+                    "VALUES ('phase_unlocked', ?, ?)",
+                    (row["id"], json.dumps({"from_phase": row["phase"],
+                                            "to_phase": new_phase, "approver": approver})))
+            return True
+        finally:
+            pconn.close()
+
     def _report_deliveries(self) -> None:
         results = getattr(self, "_delivery_results", [])
         if not results:
@@ -1212,12 +1280,14 @@ class ChatListener:
         for t, r in bad:
             lines.append(f"FAILED: {t} — {r}")
         lines.append(
-            "Google Chat is your ONLY communication channel. Do NOT email people "
-            "as a workaround — email is for reading/reference data only, never for "
-            "contacting a person. If someone is unreachable on Chat, do NOT keep "
-            "retrying and do NOT pretend you reached them: report it to the CEO "
-            "(Naim) and the developer (Ivan) so they can enable Chat for that "
-            "person or give you the right handle. Reply NOOP if nothing else is needed.")
+            "Google Chat is your ONLY communication channel — never email people. "
+            "A send to someone you've never reached usually FAILS because of a "
+            "Chat rule: a person must open a chat with you FIRST before you can "
+            "message them. So for each FAILED recipient, do NOT retry and do NOT "
+            "pretend you reached them. Instead send ONE Chat message to the "
+            "developer Ivan (ivan@projectbyall.com) listing those people and "
+            "asking him to have each of them send you a quick 'hi' so the channel "
+            "opens. Once Ivan confirms, retry them. Reply NOOP if nothing else is needed.")
         with self._send_lock:
             self.bridge.send_prompt("\n".join(lines), cancel_first=False)
 
