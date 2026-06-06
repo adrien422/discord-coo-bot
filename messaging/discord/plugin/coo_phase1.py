@@ -456,7 +456,23 @@ class AgentBridge:
         if self._session_exists():
             logger.info("tmux session %s already exists; reusing", cfg.tmux_session)
             return False
-        cmd = f"cd {shlex.quote(str(cfg.workdir))} && exec {shlex.quote(cfg.run_ai)} {shlex.quote(cfg.agent_kind)}"
+        # tmux new-session inherits the (long-lived) tmux SERVER's environment,
+        # NOT this listener process's env. So per-tenant vars set via systemd
+        # EnvironmentFile (CLAUDE_CONFIG_DIR for memory isolation, COO_MCP_CONFIG
+        # for MCP servers, COO_CLAUDE_BIN, MCP_TIMEOUT, …) would never reach the
+        # agent. Explicitly re-export the ones that matter into the launch cmd.
+        _FORWARD = (
+            "CLAUDE_CONFIG_DIR", "COO_CLAUDE_BIN", "COO_CODEX_BIN",
+            "COO_MCP_CONFIG", "MCP_TIMEOUT", "COO_TENANT_SLUG",
+        )
+        exports = "".join(
+            f"export {k}={shlex.quote(os.environ[k])}; "
+            for k in _FORWARD if os.environ.get(k)
+        )
+        cmd = (
+            f"cd {shlex.quote(str(cfg.workdir))} && {exports}"
+            f"exec {shlex.quote(cfg.run_ai)} {shlex.quote(cfg.agent_kind)}"
+        )
         subprocess.run(
             [
                 "tmux", "new-session", "-d",
