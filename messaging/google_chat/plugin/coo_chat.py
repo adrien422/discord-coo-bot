@@ -1131,6 +1131,10 @@ class ChatListener:
     # ---- outbound: dispatch agent reply ----
     def dispatch_response(self, response: str) -> None:
         sent_any = False
+        # Per-dispatch ground-truth log of what actually went out / failed, so
+        # we can feed the agent a factual delivery report and it stops
+        # confabulating "I messaged X" when it only intended to.
+        self._delivery_results: list[tuple[str, bool, str]] = []
         for m in CHAT_TO_RE.finditer(response):
             target = m.group(1)
             text = normalize_message_text(m.group(2))
@@ -1170,8 +1174,35 @@ class ChatListener:
         for m in COO_TASK_RE.finditer(response):
             record_task(self.cfg, _parse_kv(m.group(1)))
 
+        # Feed a factual delivery report back to the agent so it knows exactly
+        # what reached people and what failed (kills confabulation; lets it
+        # fall back to email for anyone unreachable on Chat).
+        self._report_deliveries()
+
         if not sent_any and "NOOP" not in response.upper():
             logger.debug("agent reply had no actionable markers")
+
+    def _report_deliveries(self) -> None:
+        results = getattr(self, "_delivery_results", [])
+        if not results:
+            return
+        ok = [t for t, good, _ in results if good]
+        bad = [(t, r) for t, good, r in results if not good]
+        if not bad:
+            return  # all sends succeeded — no need to nag the agent
+        lines = ["[[BRIDGE_DELIVERY_REPORT]] Ground truth on your last send — "
+                 "do NOT claim you reached anyone marked FAILED:"]
+        if ok:
+            lines.append("DELIVERED: " + ", ".join(ok))
+        for t, r in bad:
+            lines.append(f"FAILED: {t} — {r}")
+        lines.append(
+            "For anyone unreachable on Chat, you DO have email: send via "
+            "`python3 " + _tools_path() + " gmail-send --to <email> --subject S "
+            "--body B`. Use it for the FAILED recipients, or tell Naim they're "
+            "not on Chat. Reply NOOP if nothing else is needed.")
+        with self._send_lock:
+            self.bridge.send_prompt("\n".join(lines), cancel_first=False)
 
     def _send_dm(self, target: str, text: str) -> bool:
         prev = self._last_delivered.get(target)
@@ -1191,11 +1222,9 @@ class ChatListener:
                 self._email_to_space[target.lower()] = space
         if not space:
             logger.warning("could not resolve DM space for %s", target)
-            self.bridge.send_prompt(
-                f"[[BRIDGE_NOTICE]] Could not open a DM to {target}. Either we haven't "
-                f"shared a space, the email is wrong, or external chat isn't allowed.",
-                cancel_first=False,
-            )
+            self._delivery_results.append(
+                (target, False, "couldn't open a DM (no shared space / wrong "
+                 "address / external chat blocked)"))
             return False
         try:
             for chunk in _chunk_message(text, limit=3500):
@@ -1203,9 +1232,14 @@ class ChatListener:
             self._last_delivered[target] = (text, time.time())
             self._save_delivered()
             logger.info("delivered chat DM to %s (%d chars)", target, len(text))
+            self._delivery_results.append((target, True, ""))
             return True
-        except Exception:
+        except Exception as e:
+            reason = "recipient isn't reachable on Google Chat (their account " \
+                     "may not have Chat enabled / has never used it)" \
+                     if "403" in str(e) else f"send error: {str(e)[:120]}"
             logger.exception("failed to DM %s", target)
+            self._delivery_results.append((target, False, reason))
             return False
 
     def _post_channel(self, name_or_id: str, text: str) -> bool:
