@@ -38,7 +38,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -879,6 +879,7 @@ class ChatListener:
         self._load_delivered()
         self._poll_state_path = cfg.state_dir / "poll_state.json"
         self._last_seen: dict[str, str] = {}
+        self._did_initial_poll = False
         self._load_poll_state()
         self._space_by_name: dict[str, dict] = {}     # lower(displayName) -> space dict
         self._email_to_space: dict[str, str] = {}     # email -> DM space name
@@ -1001,9 +1002,20 @@ class ChatListener:
                 continue
             last = self._last_seen.get(name)
             if last is None:
-                # First time we see this space — skip its backlog
-                self._last_seen[name] = now_rfc
-                continue
+                if not self._did_initial_poll:
+                    # Very first poll after boot: baseline existing spaces to
+                    # now so we don't replay months of history on startup.
+                    self._last_seen[name] = now_rfc
+                    continue
+                # A space that appears AFTER startup is genuinely new — someone
+                # just opened a DM with Iris (e.g. a cross-domain person finally
+                # saying "hi"). Process its recent backlog (last ~2h) so that
+                # first message is NOT skipped. This is what lets the cross-
+                # domain "hi" actually register.
+                lookback = datetime.now(timezone.utc) - timedelta(hours=2)
+                last = lookback.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                self._last_seen[name] = last
+                logger.info("new space appeared post-boot: %s — reading recent backlog", name)
             msgs = self.chat.list_messages(name, last)
             for msg in msgs:
                 sender = msg.get("sender") or {}
@@ -1017,6 +1029,7 @@ class ChatListener:
                 self._handle_message(sp, msg)
                 self._last_seen[name] = msg.get("createTime", self._last_seen[name])
                 n += 1
+        self._did_initial_poll = True
         if n or spaces:
             self._save_poll_state()
         return n
