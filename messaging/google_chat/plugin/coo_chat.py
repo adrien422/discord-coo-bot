@@ -81,8 +81,12 @@ CHAT_COMMITMENT_RE = re.compile(
 CHAT_NEXT_CONTACT_RE = re.compile(
     r'\[\[COO_NEXT_CONTACT\s+user_id="?([^"\s]+)"?\s+in_seconds=(\d+)\s+reason=([^\]]+)\]\]'
 )
-# A developer DM containing "approve phase N" unlocks phase N.
-PHASE_APPROVAL_RE = re.compile(r"\bapprove\s+phase\s+([2-9])\b", re.I)
+# Phase approval from a developer. Explicit "approve phase N" sets N; a bare
+# approval ("approved", "yes", "go ahead", "lgtm") advances to current+1.
+PHASE_APPROVAL_PHASE_N_RE = re.compile(r"\bapprove(?:d|s)?\s+phase\s+([2-9])\b", re.I)
+PHASE_APPROVAL_BARE_RE = re.compile(
+    r"\b(approve|approved|approves|approval|yes[, ]+approve\w*|go\s+ahead|lgtm|"
+    r"green\s*light|unlock\s+phase)\b", re.I)
 
 
 # ----------------------------------------------------------------------------
@@ -828,12 +832,17 @@ interview the MANAGERS one by one. Phase 2 is LOCKED until a developer
 approves it — you cannot start interviewing managers on your own.
 
 When Phase 1 is complete (every checklist box filled, CEO confirmed), DM the
-developer Ivan (ivan@projectbyall.com) a Phase-2 proposal: the list of
-managers to interview and the order you'd take them in, and ask him to
-approve. A developer message containing "approve phase 2" unlocks it — the
-bridge confirms with a [[BRIDGE_PHASE_UNLOCKED phase=2]] notice. Only after
-that notice may you start DMing managers for interviews. Do not interview
-managers before the unlock.
+developer Ivan (ivan@projectbyall.com) a short Phase-2 proposal and ask him to
+approve. A developer approval ("approve phase 2", or just "approved") unlocks
+it — the bridge confirms with a [[BRIDGE_PHASE_UNLOCKED phase=2]] notice.
+
+The MOMENT you get that unlock notice, open interviews with ALL managers IN
+PARALLEL — send every manager their intro DM in the SAME reply, one
+[[COO_TO user_id=<email>]] block per manager. Do NOT go one manager at a time
+waiting for each to reply; that is far too slow. Fire all the intros at once,
+then handle replies as they trickle in. (If a manager's DM FAILS because they
+haven't opened a chat with you yet, follow the new-person onboarding rule:
+ask Ivan to get a "hi" from them.)
 
 # Recording what you learn
 
@@ -1118,12 +1127,17 @@ class ChatListener:
             if email and is_dm:
                 self._email_to_space[email] = space_name
 
-        # Developer "approve phase N" → unlock the phase in platform.tenants.
+        # Developer approval → unlock the phase in platform.tenants.
+        # "approve phase N" sets N; a bare "approved/yes/go ahead" advances by 1.
         phase_block = ""
         if dev:
-            pm = PHASE_APPROVAL_RE.search(text)
-            if pm:
-                new_phase = int(pm.group(1))
+            mN = PHASE_APPROVAL_PHASE_N_RE.search(text)
+            new_phase = None
+            if mN:
+                new_phase = int(mN.group(1))
+            elif PHASE_APPROVAL_BARE_RE.search(text):
+                new_phase = self._current_phase() + 1
+            if new_phase:
                 if self._unlock_phase(new_phase, email or display):
                     logger.info("phase advanced to %d by %s", new_phase, email)
                     phase_block = (
@@ -1242,6 +1256,16 @@ class ChatListener:
 
         if not sent_any and "NOOP" not in response.upper():
             logger.debug("agent reply had no actionable markers")
+
+    def _current_phase(self) -> int:
+        pconn = _connect(self.cfg.platform_db)
+        try:
+            row = pconn.execute(
+                "SELECT phase FROM tenants WHERE slug = ?", (self.cfg.tenant_slug,)
+            ).fetchone()
+            return int(row["phase"]) if row else 1
+        finally:
+            pconn.close()
 
     def _unlock_phase(self, new_phase: int, approver: str) -> bool:
         """Bump tenant phase in platform.tenants if new_phase is higher. Returns
