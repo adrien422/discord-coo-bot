@@ -812,18 +812,22 @@ tools do NOTHING here — only this marker actually re-pings someone.
 
 Track progress as internal notes (plain text, no [[COO_TO]] prefix).
 
-# Reaching a NEW person (Google Chat limitation)
+# Reaching people (the domain rule)
 
-You can only message someone once they have opened a chat with you. The FIRST
-contact must come from them. So to bring a new person in:
-  1. Send your [[COO_TO user_id=<email>]] as normal.
-  2. If the bridge reports it FAILED, that person hasn't opened a chat yet.
-     Do NOT retry and do NOT claim you reached them.
-  3. DM the developer Ivan (ivan@projectbyall.com): name the person(s) and ask
-     him to have each send you a quick "hi" so the channel opens.
-  4. Once they've said hi (the bridge will start delivering to them), message
-     them for real.
-This is the ONLY way to onboard a new contact. Never route around it by email.
+You are iris@projectbyall.com. Two cases:
+
+- SAME domain (@projectbyall.com): you can DM them directly, cold, anytime —
+  just [[COO_TO user_id=<email>]]. No need for them to message first.
+- DIFFERENT domain (e.g. @zeevou.com): Google blocks your FIRST message to
+  them until THEY have messaged you. So you cannot cold-DM a @zeevou.com
+  person. The bridge will report such a send as FAILED with "needs a hi".
+  When that happens, do NOT retry and do NOT claim you reached them — send one
+  Chat message to the developer Ivan (ivan@projectbyall.com) naming the
+  person + their email and asking him to have them send you a quick "hi".
+  Once they have, you can message them normally.
+
+If a SAME-domain send still fails, the address is probably wrong — flag it to
+Ivan to correct. Never email anyone as a workaround.
 
 # Phases and the Phase-2 gate
 
@@ -840,9 +844,8 @@ The MOMENT you get that unlock notice, open interviews with ALL managers IN
 PARALLEL — send every manager their intro DM in the SAME reply, one
 [[COO_TO user_id=<email>]] block per manager. Do NOT go one manager at a time
 waiting for each to reply; that is far too slow. Fire all the intros at once,
-then handle replies as they trickle in. (If a manager's DM FAILS because they
-haven't opened a chat with you yet, follow the new-person onboarding rule:
-ask Ivan to get a "hi" from them.)
+then handle replies as they trickle in. (If a manager's DM FAILS, you probably
+have the wrong address — flag it once to Ivan to correct, then move on.)
 
 # Recording what you learn
 
@@ -1304,16 +1307,35 @@ class ChatListener:
         for t, r in bad:
             lines.append(f"FAILED: {t} — {r}")
         lines.append(
-            "Google Chat is your ONLY communication channel — never email people. "
-            "A send to someone you've never reached usually FAILS because of a "
-            "Chat rule: a person must open a chat with you FIRST before you can "
-            "message them. So for each FAILED recipient, do NOT retry and do NOT "
-            "pretend you reached them. Instead send ONE Chat message to the "
-            "developer Ivan (ivan@projectbyall.com) listing those people and "
-            "asking him to have each of them send you a quick 'hi' so the channel "
-            "opens. Once Ivan confirms, retry them. Reply NOOP if nothing else is needed.")
+            "Google Chat is your ONLY channel — never email people. A FAILED send "
+            "to a DIFFERENT-domain person (e.g. @zeevou.com) means they must "
+            "message you first; a FAILED send to a same-domain (@projectbyall.com) "
+            "person usually means a wrong address. Either way: do NOT retry blindly "
+            "or pretend you reached them. Send ONE Chat message to the developer "
+            "Ivan (ivan@projectbyall.com) listing each failed name + address — for "
+            "different-domain people ask him to have them send you a 'hi'; for "
+            "same-domain ask him to correct the address. Reply NOOP if nothing else "
+            "is needed.")
         with self._send_lock:
             self.bridge.send_prompt("\n".join(lines), cancel_first=False)
+
+    def _dm_established(self, email: str) -> bool:
+        """True if a DM channel with this email already exists — i.e. they've
+        messaged Iris before (we have a cached DM space or a recorded
+        google_chat_user_id). For cross-domain people this is the prerequisite
+        for Iris being able to message them."""
+        if email.lower() in self._email_to_space:
+            return True
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM people WHERE LOWER(email)=LOWER(?) AND deleted_at IS NULL "
+                "AND google_chat_user_id IS NOT NULL AND google_chat_user_id <> ''",
+                (email,),
+            ).fetchone()
+            return bool(row)
+        finally:
+            conn.close()
 
     def _send_dm(self, target: str, text: str) -> bool:
         prev = self._last_delivered.get(target)
@@ -1321,6 +1343,22 @@ class ChatListener:
             logger.info("skipping duplicate DM to %s (within %ds)",
                         target, self.DEDUP_WINDOW_SECONDS)
             return False
+        # Cross-domain gate. Iris can cold-DM anyone in her OWN Workspace domain
+        # (e.g. @projectbyall.com). But Google blocks cold DMs to a DIFFERENT
+        # domain (e.g. @zeevou.com) until that person has messaged her first.
+        # So for a different-domain target with no established channel, don't
+        # attempt a doomed send — route it to "ask Ivan to get a hi".
+        if "@" in target and not target.startswith(("users/", "spaces/")):
+            tdom = target.split("@")[-1].lower()
+            mydom = (self.me_email.split("@")[-1].lower() if "@" in self.me_email else "")
+            if tdom and mydom and tdom != mydom and not self._dm_established(target):
+                logger.info("cross-domain DM to %s blocked (needs manual hi)", target)
+                self._delivery_results.append(
+                    (target, False, f"different domain (@{tdom}) and they haven't "
+                     f"messaged you yet — Google blocks the first contact. Ask Ivan "
+                     f"to have them send you a 'hi', then retry."))
+                return False
+
         # target is an email, a users/<id> resource, or a spaces/<id> directly.
         space: Optional[str] = None
         if target.startswith("spaces/"):
