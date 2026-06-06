@@ -298,9 +298,27 @@ def _company_map_rows(conn: sqlite3.Connection) -> dict[str, list[list[str]]]:
                   FROM risks ORDER BY status, title"""):
         risks.append([r["title"], r["l"], r["i"], r["status"], r["m"]])
 
+    # Facts — the heart of the company map, incl. per-person enrichment pulled
+    # from connected apps (HubSpot, Gleap, ClickUp, Zeevou…). Resolve the
+    # subject to a readable name so person-linked facts are obvious.
+    facts = [["Subject", "Predicate", "Value", "Asserted"]]
+    for r in q("""SELECT f.subject_kind,
+                         CASE f.subject_kind
+                           WHEN 'person'  THEN COALESCE(p.display_name, 'person#'||f.subject_id)
+                           WHEN 'team'    THEN COALESCE(t.name, 'team#'||f.subject_id)
+                           WHEN 'company' THEN 'company'
+                           ELSE f.subject_kind END subj,
+                         f.predicate, COALESCE(f.object_text,'') obj, f.asserted_at
+                  FROM facts f
+                  LEFT JOIN people p ON f.subject_kind='person' AND p.id=f.subject_id
+                  LEFT JOIN teams  t ON f.subject_kind='team'   AND t.id=f.subject_id
+                  WHERE f.is_current = 1
+                  ORDER BY f.subject_kind, subj, f.predicate"""):
+        facts.append([r["subj"], r["predicate"], r["obj"], r["asserted_at"]])
+
     return {
         "Org Chart": people, "Teams": teams, "Priorities": priorities,
-        "Decisions": decisions, "Commitments": commitments,
+        "Facts": facts, "Decisions": decisions, "Commitments": commitments,
         "Workflows": workflows, "Risks": risks,
     }
 
