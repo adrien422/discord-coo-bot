@@ -1985,12 +1985,19 @@ class ChatListener:
         conn = _connect(self.cfg.tenant_db)
         try:
             phase = self._current_phase()
+            # Leadership shown in detail; rank-and-file summarised (the full
+            # directory can be 100+ — listing all every restart is wasteful).
             people = conn.execute(
                 "SELECT p.display_name, p.email, COALESCE(p.role,'') role, "
                 "       COALESCE(t.name,'') team, p.access_tier "
                 "FROM people p LEFT JOIN teams t ON t.id=p.team_id "
-                "WHERE p.deleted_at IS NULL ORDER BY p.access_tier, p.display_name"
+                "WHERE p.deleted_at IS NULL AND p.access_tier != 'employee' "
+                "ORDER BY p.access_tier, p.display_name"
             ).fetchall()
+            staff_n = conn.execute(
+                "SELECT COUNT(*) c FROM people WHERE deleted_at IS NULL "
+                "AND access_tier='employee'"
+            ).fetchone()["c"]
             commits = conn.execute(
                 "SELECT p.display_name, c.description, COALESCE(c.due_at,'—') due "
                 "FROM commitments c JOIN people p ON p.id=c.person_id "
@@ -2008,11 +2015,15 @@ class ChatListener:
             ).fetchall()
         finally:
             conn.close()
-        out = [f"## CURRENT STATE (Phase {phase})", "", "### Org chart"]
+        out = [f"## CURRENT STATE (Phase {phase})", "", "### Leadership / org chart"]
         for r in people:
             who = f"{r['display_name']} <{r['email'] or '—'}>"
             meta = " · ".join(x for x in (r['role'], r['team'], r['access_tier']) if x)
             out.append(f"  - {who} — {meta}")
+        out.append(
+            f"  + {staff_n} more staff in the full employee directory (all in the "
+            f"`people` table with emails). You HAVE everyone's email — NEVER ask "
+            f"anyone for an email address; look it up in the directory.")
         if company:
             out += ["", "### What I know about the company"]
             out += [f"  - {r['predicate']}: {r['v']}" for r in company]
