@@ -1,50 +1,58 @@
-# Discord COO Workspace
+# COO agent — phase plan
 
-- Persistent working directory for the Claudex Discord COO agent.
-- Three-phase rollout. Currently in **PHASE 1 — top-down company mapping**.
+This document is **tenant-neutral**. Every tenant goes through the same phase plan during onboarding. Concrete identities (CEO, managers, employees) are populated by the bootstrap wizard and ongoing interviews — never hardcoded here.
 
-## Phase plan
+For the full architecture, see `ARCHITECTURE.md`. For the implementation roadmap, see `ROADMAP.md`.
 
-### Phase 1 (active) — top-down map
-- DM-only mode. Group/department/inbox features flagged OFF.
-- DM allowlist (all equal-access in this phase):
-  - Sean — CEO — primary mapping interview target.
-  - Na'im — owner — primary mapping interview target + final content authority.
-  - Adrien — developer — technical approver only.
-  - Dan — developer — technical approver only.
-- Mission: build the company map (structure, departments, members, roles, tasks, workflows, top priorities) by interviewing Sean and Na'im.
-- Second deliverable: the factsheet template Sean asked for (`company-map/factsheet-template.md`); per-person factsheets under `company-map/people/<slug>.md` follow the template.
+## Phase 0 — created, not started
 
-### Phase 2 (locked) — manager rollout
-- Agent decides when phase-1 map is rich enough.
-- Agent then DMs Adrien + Dan asking for the unlock, including: which managers to add (roles + reasoning), prioritised onboarding order (whose workflows/tasks come first), and what capabilities to unlock (expand DM allowlist, possibly re-enable specific group features).
-- Sean and Na'im cannot grant the unlock. Only Adrien + Dan can; they enact it via env-var changes + service restart.
-- Phase-2 deliverable: `company-map/access-tiers.md` defining the per-role access tiers (equal access ends here).
+Tenant DB and workspace exist; no interviews yet. The wizard transitions to Phase 1 immediately after the operator confirms.
 
-### Phase 3 (locked) — department staff rollout
-- Gradual rollout to staff under each manager, same unlock pattern.
-- Tiered access continues to be delegated by role.
+## Phase 1 — top-down map (DM-only)
 
-## Workspace layout
+- DM-only mode. Group / department / inbox features OFF.
+- Allowlist starts with **one person**: the CEO/owner registered during onboarding (`is_content_approver = 1`).
+- Mission: build the company map (structure, departments, members, roles, tasks, workflows, top priorities) by interviewing the CEO. The CEO can name additional founders to add to the allowlist; the operator (Dan or Adrien) approves the additions.
+- Deliverables (each generated as a `report` row, mirrored to disk under `company-map/`):
+  - org chart
+  - per-person factsheets (one per person mentioned)
+  - top priorities
+  - workflows for the major processes the CEO describes
+  - factsheet template
 
-- `company-map/`
-  - `org-chart.md`, `priorities.md`, `workflows.md`
-  - `factsheet-template.md`
-  - `interview-log.jsonl` — append-only record of self-scheduling decisions and bot-initiated nudges.
-  - `people/<slug>.md` — per-person factsheets following the template.
-  - `access-tiers.md` — created in phase 2.
-- `reference/transcripts/` — daily Discord transcripts (still on).
-- `reference/inbox/` — inbox flagged off; not used in stage 1.
+## Phase 2 — manager rollout (locked)
+
+- Agent decides when the Phase 1 map is rich enough.
+- Agent then DMs **the platform developers (Dan and Adrien)** with a proposal: which managers to add, recommended onboarding order, what capabilities to unlock.
+- The CEO **cannot** grant the Phase 2 unlock. Only Dan and Adrien can; they enact it via `coo tenant ...` commands and a service restart.
+- Phase-2 deliverable: `access-tiers` configuration defining what each role tier can see and do.
+- App integrations begin in this phase. When a manager mentions an external app (HubSpot, GoTo, Gleap, …), the agent surfaces a proposal to the operators; on approval the integration is enabled scoped to that manager's team.
+
+## Phase 3 — department staff rollout (locked)
+
+- Gradual rollout to staff under each manager. Same proposal-and-unlock pattern.
+- Tier-based access enforced: managers see `coo-admin`-style commands for their team, employees see read-only views.
+- Inbox / queue / follow-up machinery turns on.
+
+## Steady state
+
+After Phase 3, the tenant runs continuously. Two modes operate in parallel:
+
+- **Reactive**: respond to DMs, file inbox messages, generate factsheets on request.
+- **Proactive** (cadence loop): weekly commitment check-ins, monthly KPI review, quarterly OKR grading, continuous risk and blocker scanning. This is what makes the agent a COO instead of a meeting-notes bot.
 
 ## Self-pacing
 
-- Agent emits `[[COO_NEXT_CONTACT user_id=<id> in_seconds=<int> reason=<short>]]`. The bridge strips the marker, records the schedule, and prompts THIS same agent session at the right time. No new sessions are spawned.
+- Agent emits `[[COO_NEXT_CONTACT user_id=<id> in_seconds=<int> reason=<short>]]`. The bridge strips the marker, records a row in `scheduled_contacts`, and prompts THIS same agent session at the right time. No new sessions are spawned.
 
 ## Dev gate (absolute)
 
-- No file write or env/code change without going through `propose_doc_change.py`: Adrien + Dan must both technical-approve, then Na'im content-approves.
-- Sean and Na'im cannot bypass the dev technical gate.
+- Two sides:
+  - **Tech approval**: always Dan and Adrien (both required), recorded against `platform.developers`.
+  - **Content approval**: the tenant's CEO or designated approver, recorded against `tenant.people` with `is_content_approver = 1`.
+- Any code, schema, env, or content change goes through `doc_proposals`. Tech ≠ content: Dan and Adrien cannot unilaterally edit a tenant's company-map content; the CEO cannot bypass the tech gate.
+- Sean and Na'im are NOT hardcoded anywhere — they were specific people in an early single-tenant version of this bot. Each tenant has its own CEO discovered at onboarding.
 
 ## Secrets
 
-- Do not store plaintext secrets here; use `/home/arman/workbench/.discord_claudex.secrets` (mode `0600`).
+- Per-tenant secrets at `/var/coo/tenants/<slug>/messaging/secrets` and `.../google/credentials.json`, mode `0600`. Never in repo, never in transcripts, never in DB rows.

@@ -1,0 +1,9 @@
+{
+  "slug": "hubspot",
+  "name": "HubSpot CRM",
+  "kind_hint": "crm",
+  "description": "Recommended connection mode: mcp (community HubSpot MCP server) or http (CRM v3 API).",
+  "suggested_team": "sales",
+  "suggested_metrics": ["pipeline_value", "open_deal_count", "mean_deal_size"],
+  "common_actions": ["create_note", "update_deal_stage"]
+}
