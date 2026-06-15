@@ -55,7 +55,7 @@ from messaging.discord.plugin.coo_phase1 import (  # noqa: E402
     COO_FACT_RE, COO_COMMITMENT_RE, COO_DECISION_RE, COO_WORKFLOW_RE,
     COO_TASK_RE, COO_REPORT_RE, COO_NEXT_CONTACT_RE, COO_CLOSE_RE,
     COO_PERSON_ADD_RE, COO_INBOX_HANDLE_RE,
-    NOOP_RE,
+    NOOP_RE, CADENCE_INSTRUCTIONS,
 )
 
 logger = logging.getLogger("coo_chat")
@@ -323,6 +323,37 @@ def _connect(p: Path) -> sqlite3.Connection:
     return c
 
 
+def get_config(cfg: Config, key: str, default: str = "") -> str:
+    conn = _connect(cfg.tenant_db)
+    try:
+        row = conn.execute("SELECT value FROM system_config WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+    finally:
+        conn.close()
+
+
+def set_config(cfg: Config, key: str, value: str, notes: str = "") -> None:
+    conn = _connect(cfg.tenant_db)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO system_config (key, value, notes) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "notes=excluded.notes, updated_at=datetime('now')",
+                (key, value, notes),
+            )
+    finally:
+        conn.close()
+
+
+def is_go_live(cfg: Config) -> bool:
+    """Master switch for PROACTIVE behaviour. When OFF (default), Iris still
+    REPLIES to people who message her, but does not fire cadences, scheduled
+    follow-ups, or any self-initiated (proactive) outbound — those are held so
+    they can't reach real people while the system is still being built."""
+    return get_config(cfg, "go_live", "0").strip() in ("1", "true", "on", "yes")
+
+
 def load_company_name(cfg: Config) -> str:
     conn = _connect(cfg.platform_db)
     try:
@@ -436,15 +467,27 @@ def ensure_interview(cfg: Config, person_id: int, channel_id: Optional[int]) -> 
 
 def append_transcript(cfg: Config, interview_id: int, role: str,
                       who: str, text: str) -> None:
+    """Append one line to an interview's transcript file AND register the file
+    in the `transcripts` table so the Google Drive backup picks it up.
+
+    Names the file by the DB person's display_name (Chat hides the live sender
+    name as "Unknown", so we resolve it from the people row via the interview).
+    """
     conn = _connect(cfg.tenant_db)
     try:
         row = conn.execute(
-            "SELECT transcript_path FROM interviews WHERE id = ?", (interview_id,)
+            "SELECT i.transcript_path, i.channel_id, i.person_id, "
+            "       COALESCE(p.display_name, p.slug) AS pname "
+            "FROM interviews i LEFT JOIN people p ON p.id = i.person_id "
+            "WHERE i.id = ?", (interview_id,)
         ).fetchone()
         path = Path(row["transcript_path"]) if row and row["transcript_path"] else None
+        channel_id = row["channel_id"] if row else None
+        # Prefer the DB person's name over the (often "Unknown") live sender.
+        name_for_slug = (row["pname"] if row and row["pname"] else who) or "person"
         if not path:
             date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            slug = re.sub(r"[^a-z0-9]+", "-", who.lower()).strip("-") or "person"
+            slug = re.sub(r"[^a-z0-9]+", "-", name_for_slug.lower()).strip("-") or "person"
             path = cfg.state_dir.parent / "transcripts" / date / f"{slug}.md"
             path.parent.mkdir(parents=True, exist_ok=True)
             with conn:
@@ -455,8 +498,37 @@ def append_transcript(cfg: Config, interview_id: int, role: str,
     finally:
         conn.close()
     ts = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+    # For the per-line label, use the resolved name (not the "Unknown" sender).
+    label = who if (who and who != "Unknown") else name_for_slug
     with path.open("a", encoding="utf-8") as f:
-        f.write(f"[{ts}] **{role}** ({who}): {text}\n\n")
+        f.write(f"[{ts}] **{role}** ({label}): {text}\n\n")
+    _register_transcript_row(cfg, path, channel_id)
+
+
+def _register_transcript_row(cfg: Config, path: Path, channel_id: Optional[int]) -> None:
+    """Upsert a row in the transcripts table for this file so the Drive backup
+    (_backup_transcripts, which reads the table) actually has something to push."""
+    if channel_id is None:
+        return
+    try:
+        line_count = sum(1 for _ in path.open("r", encoding="utf-8"))
+    except Exception:
+        line_count = 0
+    date = path.parent.name  # transcripts/<YYYY-MM-DD>/<slug>.md
+    conn = _connect(cfg.tenant_db)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO transcripts (channel_id, date, file_path, line_count, "
+                "  last_appended_at) VALUES (?, ?, ?, ?, datetime('now')) "
+                "ON CONFLICT(file_path) DO UPDATE SET line_count=excluded.line_count, "
+                "  last_appended_at=datetime('now')",
+                (channel_id, date, str(path), line_count),
+            )
+    except Exception:
+        logger.exception("failed to register transcript row for %s", path)
+    finally:
+        conn.close()
 
 
 def _resolve_subject(cfg: Config, subject: str) -> tuple[str, Optional[int]]:
@@ -670,6 +742,46 @@ def record_task(cfg: Config, fields: dict) -> None:
                  fields.get("due")),
             )
         logger.info("task recorded: %s", title)
+    finally:
+        conn.close()
+
+
+def record_report(cfg: Config, fields: dict, body_md: str) -> None:
+    """Record a [[COO_REPORT …]]<md>[[/COO_REPORT]] factsheet/report: write the
+    reports table row (superseding the prior current one for same kind+subject)
+    and mirror the markdown to disk under reports/<kind>/ so the Google Docs
+    backup picks it up. Drives the (previously empty) Reports folder in Drive."""
+    kind = fields.get("kind")
+    if not kind:
+        return
+    valid = ("factsheet-person", "factsheet-team", "weekly", "monthly",
+             "org-chart", "priorities")
+    if kind not in valid:
+        kind = "factsheet-team"
+    subject = fields.get("subject") or "company"
+    title = fields.get("title") or f"{kind} — {subject}"
+    body_md = (body_md or "").strip()
+    skind, sid = _resolve_subject(cfg, subject)
+    # disk mirror
+    slug = re.sub(r"[^a-z0-9]+", "-", (str(subject)).lower()).strip("-") or "company"
+    rdir = cfg.state_dir.parent / "reports" / kind
+    rdir.mkdir(parents=True, exist_ok=True)
+    fpath = rdir / f"{slug}.md"
+    fpath.write_text(f"# {title}\n\n{body_md}\n", encoding="utf-8")
+    conn = _connect(cfg.tenant_db)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE reports SET is_current=0 WHERE report_kind=? AND "
+                "subject_kind IS ? AND (subject_id IS ? OR subject_id = ?) AND is_current=1",
+                (kind, skind, sid, sid),
+            )
+            conn.execute(
+                "INSERT INTO reports (report_kind, subject_kind, subject_id, title, "
+                "  content_md, file_path, is_current) VALUES (?, ?, ?, ?, ?, ?, 1)",
+                (kind, skind, sid, title, body_md, str(fpath)),
+            )
+        logger.info("report recorded: %s/%s", kind, subject)
     finally:
         conn.close()
 
@@ -936,6 +1048,7 @@ class ChatListener:
         self._email_to_space: dict[str, str] = {}     # email -> DM space name
         self._send_lock = threading.Lock()
         self._last_asserter_pid: Optional[int] = None
+        self._reply_target_email: Optional[str] = None
         self._stop = threading.Event()
 
     DEDUP_WINDOW_SECONDS = 90
@@ -1216,6 +1329,10 @@ class ChatListener:
                         f"[[BRIDGE_NOTICE]] Phase {new_phase} was already unlocked "
                         f"(or not higher than current). No change.\n\n")
 
+        # Remember who this turn is replying to, for the missing-marker safety
+        # net (so an un-marked prose reply gets caught and re-sent).
+        self._reply_target_email = (email or user_resource or "").lower() or None
+
         # Download any attachments to disk so the agent can Read them.
         att_block = self._save_attachments(msg, interview_id)
 
@@ -1277,16 +1394,39 @@ class ChatListener:
         # we can feed the agent a factual delivery report and it stops
         # confabulating "I messaged X" when it only intended to.
         self._delivery_results: list[tuple[str, bool, str]] = []
+        to_targets: list[str] = []
+        live = is_go_live(self.cfg)
+        reply_to = (getattr(self, "_reply_target_email", None) or "").lower()
         for m in CHAT_TO_RE.finditer(response):
             target = m.group(1)
             text = normalize_message_text(m.group(2))
             if not text:
                 continue
-            sent_any |= self._send_dm(target, text)
+            to_targets.append(target.lower())
+            # Go-live gate: when OFF, only allow a DIRECT REPLY to the person who
+            # just messaged her. Any other [[COO_TO]] is proactive/self-initiated
+            # and is HELD (logged, not delivered) so it can't reach real people
+            # during the build phase.
+            if not live and target.lower() != reply_to:
+                logger.info("HELD proactive DM to %s (go_live=off): %s",
+                            target, text[:80].replace("\n", " "))
+                self._held_count = getattr(self, "_held_count", 0) + 1
+                continue
+            ok = self._send_dm(target, text)
+            sent_any |= ok
+            # Capture Iris's OWN reply into the recipient's transcript (so the
+            # record is both halves of the conversation, not just inbound).
+            if ok:
+                self._record_outbound_transcript(target, text)
         for m in CHAT_CHANNEL_RE.finditer(response):
             name, sid, raw = m.group(1), m.group(2), m.group(3)
             text = normalize_message_text(raw)
             if not text:
+                continue
+            if not live:  # channel posts are proactive — held until go-live
+                logger.info("HELD channel post to %s (go_live=off): %s",
+                            name or sid, text[:80].replace("\n", " "))
+                self._held_count = getattr(self, "_held_count", 0) + 1
                 continue
             sent_any |= self._post_channel(name or sid, text)
 
@@ -1315,14 +1455,61 @@ class ChatListener:
             record_workflow(self.cfg, _parse_kv(m.group(1)))
         for m in COO_TASK_RE.finditer(response):
             record_task(self.cfg, _parse_kv(m.group(1)))
+        for m in COO_REPORT_RE.finditer(response):
+            record_report(self.cfg, _parse_kv(m.group(1)), m.group(2))
 
         # Feed a factual delivery report back to the agent so it knows exactly
         # what reached people and what failed (kills confabulation; lets it
         # fall back to email for anyone unreachable on Chat).
         self._report_deliveries()
 
+        # Missing-marker safety net: if this turn was a reply to a specific DM
+        # sender but the agent produced substantive prose WITHOUT a [[COO_TO]]
+        # for them and without NOOP, the reply silently became an internal
+        # note and was never delivered. Nudge the agent to re-send it wrapped
+        # in the marker (we do NOT auto-deliver, to avoid leaking genuine
+        # internal notes).
+        self._catch_unsent_reply(response, to_targets)
+
         if not sent_any and "NOOP" not in response.upper():
             logger.debug("agent reply had no actionable markers")
+
+    def _record_outbound_transcript(self, target: str, text: str) -> None:
+        """Append Iris's delivered DM into the recipient's interview transcript."""
+        person = person_by_email(self.cfg, target) if "@" in target else None
+        if not person:
+            return
+        try:
+            iid = ensure_interview(self.cfg, person["id"], None)
+            append_transcript(self.cfg, iid, "agent", self.cfg.coo_name, text)
+        except Exception:
+            logger.exception("failed to record outbound transcript to %s", target)
+
+    def _catch_unsent_reply(self, response: str, to_targets: list[str]) -> None:
+        """Detect a reply written as plain prose (no [[COO_TO]]) in answer to a
+        DM, and nudge the agent to re-emit it with the delivery marker."""
+        target = getattr(self, "_reply_target_email", None)
+        if not target:
+            return
+        # If she already addressed this sender (or anyone) this turn, fine.
+        if to_targets:
+            return
+        stripped = NOOP_RE.sub("", response).strip()
+        # Remove any [[...]] markers; what's left is "prose".
+        prose = re.sub(r"\[\[.*?\]\]", "", stripped, flags=re.S).strip()
+        # Pure NOOP / pure markers / trivial → nothing to deliver.
+        if not prose or response.strip().upper() == "NOOP" or len(prose) < 40:
+            return
+        logger.info("unsent-reply caught: prose with no [[COO_TO]] for %s", target)
+        with self._send_lock:
+            self.bridge.send_prompt(
+                f"[[BRIDGE_NOTICE]] Your last reply was written as plain text with "
+                f"NO [[COO_TO]] marker, so it was treated as a private internal note "
+                f"and NOT delivered to {target}. If you meant to send it, re-emit it "
+                f"now wrapped as [[COO_TO user_id={target}]] <your message>. If it "
+                f"truly was just a private note, reply NOOP.",
+                cancel_first=False,
+            )
 
     def _current_phase(self) -> int:
         pconn = _connect(self.cfg.platform_db)
@@ -1384,12 +1571,22 @@ class ChatListener:
             self.bridge.send_prompt("\n".join(lines), cancel_first=False)
 
     def _dm_established(self, email: str) -> bool:
-        """True if a DM channel with this email already exists — i.e. they've
-        messaged Iris before (we have a cached DM space or a recorded
-        google_chat_user_id). For cross-domain people this is the prerequisite
-        for Iris being able to message them."""
-        if email.lower() in self._email_to_space:
+        """True if a DM channel with this email already works. Checks, in order:
+          1. in-memory space cache (this run),
+          2. delivered.json — we have SUCCESSFULLY delivered to them before
+             (persists across restarts; the strongest proof the channel works),
+          3. a recorded google_chat_user_id (they messaged us),
+          4. Google's own findDirectMessage (an existing DM space server-side).
+        Fixes the post-restart false-negative where someone we already reached
+        (e.g. Thomas Bell) got wrongly blocked because the in-memory cache was
+        wiped and their chat_user_id was never set."""
+        e = email.lower()
+        if e in self._email_to_space:
             return True
+        # 2. proven prior delivery (delivered.json, loaded on init)
+        if e in self._last_delivered:
+            return True
+        # 3. recorded chat id (they messaged us)
         conn = _connect(self.cfg.tenant_db)
         try:
             row = conn.execute(
@@ -1397,9 +1594,19 @@ class ChatListener:
                 "AND google_chat_user_id IS NOT NULL AND google_chat_user_id <> ''",
                 (email,),
             ).fetchone()
-            return bool(row)
+            if row:
+                return True
         finally:
             conn.close()
+        # 4. authoritative: does Google already have a DM space with them?
+        try:
+            space = self.chat.find_dm(email)
+            if space:
+                self._email_to_space[e] = space
+                return True
+        except Exception:
+            logger.exception("find_dm check failed for %s", email)
+        return False
 
     def _send_dm(self, target: str, text: str) -> bool:
         prev = self._last_delivered.get(target)
@@ -1509,6 +1716,8 @@ class ChatListener:
             time.sleep(60)
 
     def _fire_due_contacts(self) -> None:
+        if not is_go_live(self.cfg):
+            return  # self-scheduled follow-ups are proactive — held until go-live
         conn = _connect(self.cfg.tenant_db)
         try:
             rows = conn.execute(
@@ -1584,6 +1793,119 @@ class ChatListener:
             creds_path.chmod(0o600)
         logger.info("google sync: %s", {k: v for k, v in result.items() if k != "creds_refreshed"})
 
+    # ---- operating cadences (proactive rhythm) ----
+    def run_cadence(self) -> None:
+        time.sleep(30)   # offset from the other loops
+        while not self._stop.is_set():
+            try:
+                self._fire_due_cadences()
+            except Exception:
+                logger.exception("cadence loop error")
+            for _ in range(60):
+                if self._stop.is_set():
+                    return
+                time.sleep(1)
+
+    def _fire_due_cadences(self) -> None:
+        if not is_go_live(self.cfg):
+            return  # proactive behaviour held until go-live is switched on
+        try:
+            from croniter import croniter as _croniter
+        except ImportError:
+            return
+        now = datetime.now(timezone.utc)
+        conn = _connect(self.cfg.tenant_db)
+        claimed: list[dict] = []
+        try:
+            with conn:
+                # Fire ONLY when there is an explicit, past-due next_fire_at.
+                # (A NULL next_fire_at must NOT fire — that path caused a cadence
+                # to fire immediately on seed/restart races. Seeding always sets
+                # a concrete next_fire_at, so legitimate cadences still fire.)
+                rows = conn.execute(
+                    "SELECT id, slug, name, kind FROM cadences WHERE is_active=1 "
+                    "AND next_fire_at IS NOT NULL AND next_fire_at <= datetime('now') "
+                    "ORDER BY next_fire_at ASC LIMIT 3"
+                ).fetchall()
+                for r in rows:
+                    try:
+                        next_at = _croniter(
+                            conn.execute("SELECT cron_expr FROM cadences WHERE id=?",
+                                         (r["id"],)).fetchone()["cron_expr"], now
+                        ).get_next(datetime).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        next_at = None
+                    conn.execute(
+                        "UPDATE cadences SET last_fired_at=datetime('now'), next_fire_at=? "
+                        "WHERE id=?", (next_at, r["id"]))
+                    cur = conn.execute(
+                        "INSERT INTO cadence_runs (cadence_id, started_at, status) "
+                        "VALUES (?, datetime('now'), 'running')", (r["id"],))
+                    conn.execute(
+                        "INSERT INTO audit_log (actor_kind, action, target_kind, target_id, "
+                        "payload_json) VALUES ('system','cadence_fired','cadence',?,?)",
+                        (r["id"], json.dumps({"slug": r["slug"], "kind": r["kind"]})))
+                    d = dict(r); d["run_id"] = cur.lastrowid
+                    claimed.append(d)
+        finally:
+            conn.close()
+        for row in claimed:
+            logger.info("firing cadence slug=%s kind=%s run_id=%s",
+                        row["slug"], row["kind"], row["run_id"])
+            instr = CADENCE_INSTRUCTIONS.get(row["kind"], "Run this operating cadence.")
+            prompt = (
+                f"[[BRIDGE_CADENCE kind={row['kind']} slug={row['slug']}]]\n"
+                f"A scheduled operating cadence has fired: {row['name']}.\n\n"
+                f"{instr}\n\n"
+                f"{self._cadence_context(row['kind'])}\n"
+                f"Act now: DM people via [[COO_TO user_id=<email>]], record outcomes "
+                f"with [[COO_FACT]]/[[COO_COMMITMENT]], write factsheets with "
+                f"[[COO_REPORT …]]…[[/COO_REPORT]], schedule chases with "
+                f"[[COO_NEXT_CONTACT]]. Reply NOOP if nothing is genuinely worth "
+                f"doing this cycle. Remember: only DELIVERED [[COO_TO]] messages reach "
+                f"people; plain prose is just a private note."
+            )
+            with self._send_lock:
+                self.bridge.send_prompt(prompt, cancel_first=False)
+            conn = _connect(self.cfg.tenant_db)
+            try:
+                with conn:
+                    conn.execute(
+                        "UPDATE cadence_runs SET finished_at=datetime('now'), "
+                        "status='succeeded' WHERE id=?", (row["run_id"],))
+            finally:
+                conn.close()
+
+    def _cadence_context(self, kind: str) -> str:
+        """A little DB context so the cadence isn't blind."""
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            if kind in ("weekly-pulse", "daily-brief", "commitment-check"):
+                rows = conn.execute(
+                    "SELECT c.description, c.due_at, c.status, p.display_name, p.email "
+                    "FROM commitments c JOIN people p ON p.id=c.person_id "
+                    "WHERE c.status='open' ORDER BY c.due_at IS NULL, c.due_at ASC LIMIT 20"
+                ).fetchall()
+                if not rows:
+                    return "DB context: no open commitments on file."
+                return "Open commitments:\n" + "\n".join(
+                    f"  - {r['display_name']} <{r['email']}>: \"{r['description']}\" "
+                    f"due {r['due_at'] or '—'}" for r in rows)
+            if kind == "risk-review":
+                rows = conn.execute(
+                    "SELECT title, status, COALESCE(likelihood,'?') l, COALESCE(impact,'?') i "
+                    "FROM risks WHERE status='open' ORDER BY title LIMIT 20").fetchall()
+                return ("Open risks:\n" + "\n".join(
+                    f"  - {r['title']} (L:{r['l']}/I:{r['i']})" for r in rows)
+                    ) if rows else "DB context: no risks recorded yet — consider capturing some."
+            if kind == "factsheet-refresh":
+                n = conn.execute("SELECT COUNT(*) c FROM people WHERE deleted_at IS NULL").fetchone()["c"]
+                return (f"DB context: {n} people in the org chart. Refresh the org-chart "
+                        f"factsheet + any per-team factsheets via [[COO_REPORT]].")
+            return ""
+        finally:
+            conn.close()
+
     def run(self) -> None:
         new_session = self.bridge.ensure_session()
         first_mark = self.cfg.state_dir / "first_start_done"
@@ -1615,6 +1937,7 @@ class ChatListener:
             threading.Thread(target=self.run_poll, daemon=True, name="poll"),
             threading.Thread(target=self.run_schedule, daemon=True, name="schedule"),
             threading.Thread(target=self.run_integration_sync, daemon=True, name="g-sync"),
+            threading.Thread(target=self.run_cadence, daemon=True, name="cadence"),
         ]
         for t in threads:
             t.start()
@@ -1631,28 +1954,83 @@ class ChatListener:
             t.join(timeout=3)
 
     def _restart_amendment(self) -> str:
-        """Compose the amendment delivered when the listener restarts on an
-        existing tenant. Includes a list of who's already been DM'd so the
-        agent doesn't re-cold-introduce after a session reset."""
-        prior_lines = []
-        for target, value in list(self._last_delivered.items())[:25]:
-            text = value[0] if isinstance(value, (list, tuple)) else value
-            preview = text.replace("\n", " ")[:80]
-            prior_lines.append(f"  - {target}: \"{preview}…\"")
-        prior = ("PRIOR DELIVERIES (from your earlier session — do NOT cold-intro "
-                 "to any of these people again; pick up the conversation as it "
-                 "stood):\n" + "\n".join(prior_lines) + "\n\n") if prior_lines else ""
+        """Composed on restart: re-grounds the agent in the FULL current state
+        (rebuilt from the DB so it survives the in-pane memory loss) plus the
+        operating rules. This is the durable-context backbone — Iris boots
+        knowing where everything stands, not from a wiped REPL."""
+        gate = ("LIVE (you may send proactively)." if is_go_live(self.cfg)
+                else "NOT LIVE — proactive sends are HELD by the bridge. You "
+                     "still REPLY to anyone who messages you, but cadences, "
+                     "self-scheduled follow-ups, and cold outreach will NOT be "
+                     "delivered until the developer switches go-live on. Don't "
+                     "fight it; just answer inbound messages normally.")
         return (
-            "[[BRIDGE_NOTICE]] The Chat listener restarted. You are still "
-            "connected; do NOT re-introduce yourself to anyone you've already "
-            "DM'd. Continue the conversation in-place.\n\n"
-            + prior +
+            "[[BRIDGE_NOTICE]] The Chat listener restarted. You did NOT lose the "
+            "company picture — here it is, rebuilt from the database. Do NOT "
+            "re-introduce yourself to anyone listed below; pick up where things "
+            "stood.\n\n"
+            + self._build_state_brief() +
+            f"\nGO-LIVE STATUS: {gate}\n\n"
             "SCHEDULING — [[COO_NEXT_CONTACT user_id=<email> in_seconds=N "
-            "reason=R]] is your ONLY real scheduling mechanism (ScheduleWakeup "
-            "/ Cron* do nothing). Any 'I'll follow up in N hours' MUST emit a "
-            "[[COO_NEXT_CONTACT]] in the same reply.\n\n"
+            "reason=R]] is your ONLY real scheduling mechanism. Any 'I'll follow "
+            "up' MUST emit it in the same reply.\n"
+            "DELIVERY — only text wrapped in [[COO_TO user_id=<email>]] is sent; "
+            "plain prose is a private note and reaches no one.\n\n"
             "Reply NOOP and resume."
         )
+
+    def _build_state_brief(self) -> str:
+        """DB-derived snapshot of the live operating picture. Rebuilt fresh each
+        time, so it can never go stale or be lost on restart."""
+        conn = _connect(self.cfg.tenant_db)
+        try:
+            phase = self._current_phase()
+            people = conn.execute(
+                "SELECT p.display_name, p.email, COALESCE(p.role,'') role, "
+                "       COALESCE(t.name,'') team, p.access_tier "
+                "FROM people p LEFT JOIN teams t ON t.id=p.team_id "
+                "WHERE p.deleted_at IS NULL ORDER BY p.access_tier, p.display_name"
+            ).fetchall()
+            commits = conn.execute(
+                "SELECT p.display_name, c.description, COALESCE(c.due_at,'—') due "
+                "FROM commitments c JOIN people p ON p.id=c.person_id "
+                "WHERE c.status='open' ORDER BY c.due_at IS NULL, c.due_at LIMIT 15"
+            ).fetchall()
+            pend = conn.execute(
+                "SELECT p.display_name, sc.fire_at, substr(sc.reason,1,70) reason "
+                "FROM scheduled_contacts sc JOIN people p ON p.id=sc.person_id "
+                "WHERE sc.status='pending' ORDER BY sc.fire_at LIMIT 15"
+            ).fetchall()
+            company = conn.execute(
+                "SELECT predicate, substr(object_text,1,90) v FROM facts "
+                "WHERE is_current=1 AND subject_kind='company' "
+                "ORDER BY id DESC LIMIT 18"
+            ).fetchall()
+        finally:
+            conn.close()
+        out = [f"## CURRENT STATE (Phase {phase})", "", "### Org chart"]
+        for r in people:
+            who = f"{r['display_name']} <{r['email'] or '—'}>"
+            meta = " · ".join(x for x in (r['role'], r['team'], r['access_tier']) if x)
+            out.append(f"  - {who} — {meta}")
+        if company:
+            out += ["", "### What I know about the company"]
+            out += [f"  - {r['predicate']}: {r['v']}" for r in company]
+        if commits:
+            out += ["", "### Open commitments"]
+            out += [f"  - {r['display_name']}: \"{r['description']}\" (due {r['due']})"
+                    for r in commits]
+        if pend:
+            out += ["", "### Scheduled follow-ups (pending)"]
+            out += [f"  - {r['display_name']} @ {r['fire_at']}: {r['reason']}"
+                    for r in pend]
+        if self._last_delivered:
+            out += ["", "### Already in conversation with (do NOT re-introduce)"]
+            for target, value in list(self._last_delivered.items())[:25]:
+                txt = (value[0] if isinstance(value, (list, tuple)) else value)
+                out.append(f"  - {target}: last said \"{txt.replace(chr(10),' ')[:70]}…\"")
+        out.append("")
+        return "\n".join(out)
 
 
 # ----------------------------------------------------------------------------
